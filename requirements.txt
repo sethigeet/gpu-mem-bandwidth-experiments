@@ -1,0 +1,13 @@
+numpy==2.4.4
+pandas==3.0.2
+
+# PyTorch (choose one)
+# --extra-index-url https://download.pytorch.org/whl/cpu
+# torch==2.11.0+cpu
+# --extra-index-url https://download.pytorch.org/whl/cu124
+# torch==2.11.0+cu124
+
+# Dev dependencies
+ty==0.0.34
+ruff==0.15.12
+typing-extensions==4.15.0
