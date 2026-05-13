@@ -4,7 +4,8 @@ set -euo pipefail
 # sync the local project to the remote host (also sets the HOST and REMOTE_DIR vars)
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/sync_remote.sh"
 
-OUT=${OUT:-results/attention_bw_ncu.csv}
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+OUT=${OUT:-results/attention_bw_ncu_${TIMESTAMP}.csv}
 if [[ $# -gt 0 ]]; then
   shift
 fi
