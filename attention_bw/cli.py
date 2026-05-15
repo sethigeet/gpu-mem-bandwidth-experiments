@@ -16,14 +16,21 @@ DEFAULT_KERNELS = ["sdpa_math", "sdpa_mem_efficient", "sdpa_flash"]
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Benchmark attention kernel memory bandwidth on CUDA GPUs.")
+    parser = argparse.ArgumentParser(
+        description="Benchmark decode-stage attention kernel memory bandwidth on CUDA GPUs."
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     run_parser = subparsers.add_parser("run", help="Run kernels for NCU profiling")
     run_parser.add_argument("--kernels", nargs="+", default=DEFAULT_KERNELS, choices=[*KERNELS, "all"])
-    run_parser.add_argument("--shape", type=parse_shape, action="append", default=[])
+    run_parser.add_argument(
+        "--shape",
+        type=parse_shape,
+        action="append",
+        default=[],
+        help="Decode shape B,H,CACHE_SEQ,D. Q uses one token; K/V use CACHE_SEQ tokens.",
+    )
     run_parser.add_argument("--dtype", choices=["fp16", "bf16", "fp32"], default="fp16")
-    run_parser.add_argument("--causal", action="store_true")
     run_parser.add_argument("--warmup", type=int, default=10)
     run_parser.add_argument("--iters", type=int, default=50)
 
@@ -42,18 +49,23 @@ def run_benchmarks(args: argparse.Namespace) -> int:
         args.kernels = list(KERNELS)
 
     shapes = args.shape or DEFAULT_SHAPES
-    cases = [Case(b, h, s, d, args.dtype, args.causal) for b, h, s, d in shapes]
+    cases = [Case(b, h, cache_seq, d, args.dtype) for b, h, cache_seq, d in shapes]
 
     failures: list[str] = []
     for case in cases:
         for kernel in args.kernels:
             try:
-                print(f"Running {kernel} with shape ({case.batch}, {case.heads}, {case.seq}, {case.dim})", flush=True)
+                print(
+                    f"Running {kernel} with decode shape "
+                    f"Q=({case.batch}, {case.heads}, 1, {case.dim}), "
+                    f"K/V=({case.batch}, {case.heads}, {case.cache_seq}, {case.dim})",
+                    flush=True,
+                )
                 run_case(case, kernel, args.warmup, args.iters)
                 print("  Done.", flush=True)
             except Exception as exc:
-                shape = f"{case.batch},{case.heads},{case.seq},{case.dim}"
-                failures.append(f"{kernel} B,H,S,D={shape}: {exc}")
+                shape = f"{case.batch},{case.heads},{case.cache_seq},{case.dim}"
+                failures.append(f"{kernel} B,H,CACHE_SEQ,D={shape}: {exc}")
                 print("  Failed.", flush=True)
 
     if failures:

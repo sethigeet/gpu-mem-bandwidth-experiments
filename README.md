@@ -1,6 +1,6 @@
-# Attention Kernel Memory Bandwidth
+# Decode Attention Kernel Memory Bandwidth
 
-This project measures memory-bandwidth behavior for attention kernels on an NVIDIA GPU host reachable over SSH. Local dependencies stay CPU/tooling-only; CUDA and attention-kernel packages are installed only on the remote machine through `uv`.
+This project measures memory-bandwidth behavior for decode-stage attention kernels on an NVIDIA GPU host reachable over SSH. Local dependencies stay CPU/tooling-only; CUDA and attention-kernel packages are installed only on the remote machine through `uv`.
 
 ## Remote Setup
 
@@ -48,6 +48,8 @@ Run specific shapes and kernels:
   --out results/hinton_attention_bw.csv
 ```
 
+Shapes are specified as `B,H,CACHE_SEQ,D`. The benchmark creates a single-token query tensor with shape `B,H,1,D` and KV-cache tensors with shape `B,H,CACHE_SEQ,D`, matching the attention work in one decode step.
+
 If optional packages are installed:
 
 ```bash
@@ -73,7 +75,7 @@ The table includes:
 - `utilization_pct_of_peak`: estimated bandwidth divided by peak bandwidth inferred from `nvidia-smi`.
 - `tflops`: rough attention matmul FLOP rate, excluding softmax overhead.
 
-For fused kernels such as FlashAttention, `effective_gb_s` is based on Q/K/V/O tensor traffic, not full score-matrix materialization. For `sdpa_math`, the estimate includes read/write traffic for the materialized attention score/probability matrices. Treat these as comparable effective-bandwidth indicators, not exact HBM byte counters. Use `run_ncu_remote.sh` when exact DRAM counter data is required.
+For fused kernels such as FlashAttention, `effective_gb_s` is based on single-token Q/O traffic plus KV-cache traffic, not full score-matrix materialization. For `sdpa_math`, the estimate includes read/write traffic for the materialized attention score/probability matrices. Treat these as comparable effective-bandwidth indicators, not exact HBM byte counters. Use `run_ncu_remote.sh` when exact DRAM counter data is required.
 
 If `nvidia-smi` cannot report memory clock and bus width, set peak bandwidth manually:
 

@@ -5,7 +5,6 @@ from dataclasses import dataclass
 class Case:
     batch: int
     heads: int
-    seq: int
+    cache_seq: int
     dim: int
     dtype: str
-    causal: bool
