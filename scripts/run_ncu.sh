@@ -10,7 +10,7 @@ mkdir -p "$(dirname "$OUT")"
 
 ncu \
   --target-processes all \
-  --nvtx --nvtx-include "regex:attention_bw:.*:iter" \
+  --nvtx --nvtx-include "regex:attention_bw:.*:iter]" \
   --metrics dram__bytes_read.sum,dram__bytes_write.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__time_duration.sum \
   --csv --log-file "$OUT" \
   uv run main.py run --kernels all \
