@@ -16,16 +16,28 @@ def run_case(case: Case, kernel_name: str, warmup: int, iters: int) -> None:
     q, k, v = make_tensors(case, device)
     fn = get_kernel(kernel_name)
 
-    for _ in range(warmup):
-        fn(q, k, v, case.causal)
-    torch.cuda.synchronize()
-
-    out = None
-    for _ in range(iters):
-        out = fn(q, k, v, case.causal)
+    torch.cuda.nvtx.range_push(f"attention_bw:{kernel_name}:case")
+    try:
+        for _ in range(warmup):
+            torch.cuda.nvtx.range_push(f"attention_bw:{kernel_name}:warmup")
+            try:
+                fn(q, k, v, False)
+            finally:
+                torch.cuda.nvtx.range_pop()
         torch.cuda.synchronize()
-        if out.numel() == 0:
-            raise RuntimeError("empty output")
+
+        out = None
+        for _ in range(iters):
+            torch.cuda.nvtx.range_push(f"attention_bw:{kernel_name}:iter")
+            try:
+                out = fn(q, k, v, False)
+            finally:
+                torch.cuda.nvtx.range_pop()
+            torch.cuda.synchronize()
+            if out.numel() == 0:
+                raise RuntimeError("empty output")
+    finally:
+        torch.cuda.nvtx.range_pop()
 
     del q, k, v
     if out is not None:

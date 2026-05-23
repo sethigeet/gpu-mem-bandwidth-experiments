@@ -6,16 +6,15 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 
-ATTENTION_KERNEL_PATTERNS = [
+NCU_KERNEL_PATTERNS = [
     (r"flash_fwd", "sdpa_flash"),
     (r"fmha_cutlass", "sdpa_mem_efficient"),
-    (r"softmax_warp_forward", "sdpa_math"),
     (r"cunn_SoftMax", "sdpa_math"),
 ]
 
 
-def classify_kernel(name: str) -> str | None:
-    for pattern, label in ATTENTION_KERNEL_PATTERNS:
+def classify_ncu_kernel(name: str) -> str | None:
+    for pattern, label in NCU_KERNEL_PATTERNS:
         if re.search(pattern, name, re.IGNORECASE):
             return label
     return None
@@ -33,7 +32,7 @@ def load_results(path: Path) -> pd.DataFrame:
         aggfunc="first",
     ).reset_index()
     pivoted.columns.name = None
-    pivoted["kernel_type"] = pivoted["Kernel Name"].apply(classify_kernel)
+    pivoted["kernel_type"] = pivoted["Kernel Name"].apply(classify_ncu_kernel)
     pivoted = pivoted[pivoted["kernel_type"].notna()]
     return pivoted
 
@@ -87,8 +86,67 @@ def visualize(df: pd.DataFrame, output: Path | None = None) -> None:
         plt.show()
 
 
-def load_nsys_metrics(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_nvtx_ranges(conn: sqlite3.Connection) -> pd.DataFrame:
+    tables = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table'", conn)
+    table_names = tables["name"].tolist()
+
+    for table in ["NVTX_EVENTS", "NVTX_RANGES"]:
+        if table not in table_names:
+            continue
+        try:
+            df = pd.read_sql_query(
+                f"""
+                SELECT start, end, text as name
+                FROM {table}
+                WHERE end IS NOT NULL AND text IS NOT NULL AND text != ''
+                ORDER BY start
+                """,
+                conn,
+            )
+            if not df.empty:
+                return df
+        except Exception:
+            continue
+    return pd.DataFrame(columns=["start", "end", "name"])
+
+
+def filter_by_nvtx(
+    df: pd.DataFrame,
+    nvtx: pd.DataFrame,
+    include_pattern: str,
+    exclude_pattern: str | None = None,
+    start_col: str = "start",
+) -> pd.DataFrame:
+    include_ranges = nvtx[nvtx["name"].str.contains(include_pattern, regex=True)]
+    if include_ranges.empty:
+        return df
+
+    mask = pd.Series(False, index=df.index)
+    for _, row in include_ranges.iterrows():
+        mask |= (df[start_col] >= row["start"]) & (df[start_col] <= row["end"])
+
+    if exclude_pattern:
+        exclude_ranges = nvtx[nvtx["name"].str.contains(exclude_pattern, regex=True)]
+        for _, row in exclude_ranges.iterrows():
+            mask &= ~((df[start_col] >= row["start"]) & (df[start_col] <= row["end"]))
+
+    return df[mask].copy()
+
+
+def classify_by_nvtx(df: pd.DataFrame, nvtx: pd.DataFrame, start_col: str = "start") -> pd.Series:
+    case_ranges = nvtx[nvtx["name"].str.endswith(":case")]
+    kernel_types = pd.Series(index=df.index, dtype="object")
+    for _, row in case_ranges.iterrows():
+        mask = (df[start_col] >= row["start"]) & (df[start_col] <= row["end"])
+        kernel_type = row["name"].split(":")[1]
+        kernel_types.loc[mask] = kernel_type
+    return kernel_types
+
+
+def load_nsys_metrics(path: Path, exclude_warmup: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
     conn = sqlite3.connect(path)
+    nvtx = load_nvtx_ranges(conn)
+
     metrics = pd.read_sql_query(
         """
         SELECT m.timestamp, m.metricId, m.value, i.metricName as metric_name
@@ -107,30 +165,25 @@ def load_nsys_metrics(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
         """,
         conn,
     )
-    conn.close()
 
-    kernels["kernel_type"] = kernels["name"].apply(classify_kernel)
+    kernels["kernel_type"] = classify_by_nvtx(kernels, nvtx)
+    metrics["kernel_type"] = classify_by_nvtx(metrics, nvtx, start_col="timestamp")
+
+    if exclude_warmup:
+        kernels = filter_by_nvtx(kernels, nvtx, r":case$", r":warmup$")
+        metrics = filter_by_nvtx(metrics, nvtx, r":case$", r":warmup$", start_col="timestamp")
+
+    conn.close()
 
     return metrics, kernels
 
 
-def filter_metrics_by_kernel(
-    metrics: pd.DataFrame, kernels: pd.DataFrame, kernel_type: str
-) -> pd.DataFrame:
-    type_kernels = kernels[kernels["kernel_type"] == kernel_type]
-    if type_kernels.empty:
-        return pd.DataFrame()
-
-    mask = pd.Series(False, index=metrics.index)
-    for _, row in type_kernels.iterrows():
-        mask |= (metrics["timestamp"] >= row["start"]) & (metrics["timestamp"] <= row["end"])
-    return metrics[mask].copy()
+def filter_metrics_by_kernel(metrics: pd.DataFrame, kernel_type: str) -> pd.DataFrame:
+    return metrics[metrics["kernel_type"] == kernel_type].copy()
 
 
-def plot_kernel_bandwidth(
-    metrics: pd.DataFrame, kernels: pd.DataFrame, kernel_type: str, ax: plt.Axes
-) -> None:
-    filtered = filter_metrics_by_kernel(metrics, kernels, kernel_type)
+def plot_kernel_bandwidth(metrics: pd.DataFrame, kernel_type: str, ax: plt.Axes) -> None:
+    filtered = filter_metrics_by_kernel(metrics, kernel_type)
     bw_metrics = filtered[filtered["metric_name"].str.contains("DRAM", na=False)]
 
     if bw_metrics.empty:
@@ -153,10 +206,8 @@ def plot_kernel_bandwidth(
     ax.grid(True, alpha=0.3)
 
 
-def plot_kernel_sm(
-    metrics: pd.DataFrame, kernels: pd.DataFrame, kernel_type: str, ax: plt.Axes
-) -> None:
-    filtered = filter_metrics_by_kernel(metrics, kernels, kernel_type)
+def plot_kernel_sm(metrics: pd.DataFrame, kernel_type: str, ax: plt.Axes) -> None:
+    filtered = filter_metrics_by_kernel(metrics, kernel_type)
     sm_metrics = filtered[filtered["metric_name"].str.contains("SMs Active", na=False)]
 
     if sm_metrics.empty:
@@ -179,10 +230,9 @@ def plot_kernel_sm(
     ax.grid(True, alpha=0.3)
 
 
-def visualize_nsys(path: Path, output: Path | None = None) -> None:
-    metrics, kernels = load_nsys_metrics(path)
-    kernel_types = [kt for kt in ["sdpa_math", "sdpa_mem_efficient", "sdpa_flash"]
-                    if kt in kernels["kernel_type"].values]
+def visualize_nsys(path: Path, output: Path | None = None, exclude_warmup: bool = True) -> None:
+    metrics, _ = load_nsys_metrics(path, exclude_warmup=exclude_warmup)
+    kernel_types = [kt for kt in metrics["kernel_type"].dropna().unique()]
 
     if not kernel_types:
         print("No attention kernels found")
@@ -193,8 +243,8 @@ def visualize_nsys(path: Path, output: Path | None = None) -> None:
         axes = axes.reshape(-1, 1)
 
     for i, kernel_type in enumerate(kernel_types):
-        plot_kernel_bandwidth(metrics, kernels, kernel_type, axes[0, i])
-        plot_kernel_sm(metrics, kernels, kernel_type, axes[1, i])
+        plot_kernel_bandwidth(metrics, kernel_type, axes[0, i])
+        plot_kernel_sm(metrics, kernel_type, axes[1, i])
 
     fig.suptitle("DRAM Bandwidth (top) and SM Utilization (bottom) by Kernel Type", fontsize=12)
     plt.tight_layout()

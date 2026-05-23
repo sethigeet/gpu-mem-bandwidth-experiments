@@ -12,11 +12,12 @@ nsys profile \
   --trace=cuda,nvtx \
   --gpu-metrics-devices=all \
   --gpu-metrics-frequency=200000 \
+  --duration=0 \
   --output="$OUT" \
   --force-overwrite=true \
   uv run main.py run \
-  --iters 10 \
-  --warmup 1 "$@"
+  --iters 5 \
+  --warmup 2 "$@"
 
 nsys export --type=sqlite --output="${OUT}.sqlite" "${OUT}.nsys-rep"
 echo "Exported to ${OUT}.sqlite"
