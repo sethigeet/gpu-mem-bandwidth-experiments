@@ -7,6 +7,9 @@ transformers>=4.40.0
 accelerate>=0.30.0
 sentencepiece
 
+# prefix_bw  — vLLM is GPU-host-only
+# vllm
+
 # PyTorch (choose one)
 # --extra-index-url https://download.pytorch.org/whl/cpu
 # torch==2.11.0+cpu

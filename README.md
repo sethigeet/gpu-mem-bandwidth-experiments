@@ -13,6 +13,11 @@ There are two benchmark suites:
 - **`llm_bw`** — a full Hugging Face transformer model running the decode phase end to end.
   Use this to see where time and bandwidth go across the whole model (attention, linear
   layers, norms, etc.).
+- **`prefix_bw`** — reproduces the prefix-homogeneity claims of the *Feather* paper
+  ("Requests of a Feather Must Flock Together", `Cache_aware_LLM_batching.pdf`) on vLLM with
+  prefix caching. Builds batches of requests that physically share KV-cache prefixes and
+  measures how decode throughput and DRAM bandwidth change with homogeneity, shared-prefix
+  length, number of prefix groups, and batch size.
 
 The local machine is assumed to have **no GPU**. Everything that needs CUDA runs on a remote
 host over SSH; the `*_remote.sh` scripts sync the repo, run the profiler remotely, render the
@@ -89,6 +94,54 @@ scripts/run_llm_nsys_remote.sh hinton-01 --model mistral-7b --attention flash_at
 > NCU runs every kernel multiple times to collect counters, so it is slow. The LLM NCU wrapper
 > caps decode to 1 token; keep token counts small when profiling with `ncu`.
 
+## prefix_bw — Feather prefix-homogeneity reproduction
+
+Reproduces the paper's claim that, because decode is memory-bandwidth bound, batches whose
+requests **physically share a KV-cache prefix** get better spatial/temporal locality (higher
+effective DRAM bandwidth, fewer bytes fetched) and so higher decode throughput. Requests are
+built as raw token-id lists; identical leading tokens make vLLM's prefix cache store the shared
+prefix once and let every request in the group read the same KV blocks.
+
+vLLM is a GPU-host-only dependency. Install it once into the remote venv:
+
+```bash
+scripts/install_vllm_remote.sh        # uv pip install vllm on the remote
+```
+
+Each subcommand sweeps one knob and writes a throughput CSV + plot. The `EXPERIMENT` is one of
+`homogeneity` (Fig 4), `prefix-length` (Fig 5), `num-groups` (Fig 6), `batch-size` (Figs 8–9):
+
+```bash
+# Fig 4: vary the fraction of requests on a shared prefix (homogeneous beta=0/1 vs mixed)
+scripts/run_prefix_remote.sh homogeneity --model llama-7b --num-requests 256
+
+# Fig 5: vary the shared prefix length
+scripts/run_prefix_remote.sh prefix-length --total-len 4096
+
+# Fig 6: vary the number of distinct prefix groups
+scripts/run_prefix_remote.sh num-groups --values 1,2,4,8,16,32
+
+# Figs 8-9: sweep batch size for homogeneous vs heterogeneous workloads (two lines)
+scripts/run_prefix_remote.sh batch-size --values 16,32,64,128,256 --hetero-groups 5
+```
+
+To verify the **bandwidth** claim directly (not just throughput), profile a single config under
+nsys and render the DRAM-bandwidth timeline (reusing the `llm_bw` nsys visualizer). Pass one
+sweep value so the timeline is clean — e.g. fully homogeneous vs mixed:
+
+```bash
+scripts/run_prefix_nsys_remote.sh homogeneity --values 1.0   # homogeneous: high BW
+scripts/run_prefix_nsys_remote.sh homogeneity --values 0.5   # mixed: lower BW
+```
+
+Common knobs (all subcommands): `--model` (registry key or raw HF id), `--dtype`,
+`--num-requests`, `--decode-tokens`, `--max-num-seqs` (vLLM batch size),
+`--gpu-memory-utilization`, `--values` (the sweep points), `--no-warmup`. The measured
+`generate` is wrapped in `prefix_bw:...:case` NVTX ranges (with `...:warmup` around prefix-cache
+warmup) so the nsys visualizer isolates decode, exactly like `llm_bw`. Defaults are scaled down
+from the paper (which used Llama-3-8B with 10K-token prefixes); raise `--prefix-len` /
+`--total-len` / `--num-requests` toward those to match it more closely.
+
 ## Profiling details
 
 - **NVTX ranges** wrap warmup and measured iterations (`...:warmup`, `...:iter`, `...:case`). The
@@ -128,4 +181,5 @@ The `*_remote.sh` scripts are thin wrappers around `scripts/run_{ncu,nsys}.sh` a
 ```bash
 uv run main.py run --kernels all --shape 2,64,4096,128
 uv run llm_main.py run --model phi-3-mini --decode-tokens 50
+uv run prefix_main.py homogeneity -o results/prefix_homo.csv --model llama-7b
 ```
