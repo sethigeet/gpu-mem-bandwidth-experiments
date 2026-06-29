@@ -36,12 +36,13 @@ def load_model(
     model_id = MODEL_REGISTRY[model_name]
     torch_dtype = DTYPE_MAP[dtype]
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
+        local_files_only=True,
         torch_dtype=torch_dtype,
         attn_implementation=attention_impl,
         device_map="cuda",
