@@ -24,6 +24,7 @@ class Workload:
     requests: list[list[int]]
     shared_prefixes: list[list[int]]
     description: str
+    prefix_group_ids: list[int] = field(default_factory=list)
     params: dict = field(default_factory=dict)
 
     @property
@@ -81,15 +82,19 @@ def build_homogeneity_fraction(
 
     n_a = round(beta * num_requests)
     requests: list[list[int]] = []
+    prefix_group_ids: list[int] = []
     for uid in range(num_requests):
-        prefix = prefix_a if uid < n_a else prefix_b
+        group = 0 if uid < n_a else 1
+        prefix = prefix_a if group == 0 else prefix_b
         requests.append(prefix + _make_suffix(uid, suffix_len, vocab_size, seed))
+        prefix_group_ids.append(group)
 
     return Workload(
         name="homogeneity_fraction",
         requests=requests,
         shared_prefixes=[prefix_a, prefix_b],
         description=f"beta={beta} ({n_a}/{num_requests} on prefix A), prefix_len={prefix_len}",
+        prefix_group_ids=prefix_group_ids,
         params={"beta": beta, "n_a": n_a, "num_requests": num_requests, "prefix_len": prefix_len},
     )
 
@@ -109,15 +114,18 @@ def build_shared_length(
     shared_prefix = _make_prefix(0, shared_len, vocab_size, seed)
 
     requests: list[list[int]] = []
+    prefix_group_ids: list[int] = []
     for uid in range(num_requests):
         unique = _make_suffix(uid, total_len - shared_len, vocab_size, seed)
         requests.append(shared_prefix + unique)
+        prefix_group_ids.append(0 if shared_len else uid)
 
     return Workload(
         name="shared_length",
         requests=requests,
         shared_prefixes=[shared_prefix] if shared_len else [],
         description=f"share_fraction={share_fraction}, shared_len={shared_len}/{total_len}",
+        prefix_group_ids=prefix_group_ids,
         params={
             "share_fraction": share_fraction,
             "shared_len": shared_len,
@@ -141,14 +149,18 @@ def build_num_groups(
     prefixes = [_make_prefix(g, prefix_len, vocab_size, seed) for g in range(num_groups)]
 
     requests: list[list[int]] = []
+    prefix_group_ids: list[int] = []
     for uid in range(num_requests):
-        prefix = prefixes[uid % num_groups]
+        group = uid % num_groups
+        prefix = prefixes[group]
         requests.append(prefix + _make_suffix(uid, suffix_len, vocab_size, seed))
+        prefix_group_ids.append(group)
 
     return Workload(
         name="num_groups",
         requests=requests,
         shared_prefixes=prefixes,
         description=f"num_groups={num_groups}, prefix_len={prefix_len}, requests={num_requests}",
+        prefix_group_ids=prefix_group_ids,
         params={"num_groups": num_groups, "prefix_len": prefix_len, "num_requests": num_requests},
     )

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Sync the repo, run a prefix-sharing sweep remotely, and copy back the CSV + plot.
 # Usage: run_prefix_remote.sh EXPERIMENT [extra prefix_main.py args...]
-#   EXPERIMENT: homogeneity | prefix-length | num-groups | batch-size
+#   EXPERIMENT: homogeneity | prefix-length | num-groups | batch-size | schedule
 # Host / remote dir come from scripts/sync_remote.sh defaults.
 
 EXPERIMENT=${1:?usage: run_prefix_remote.sh EXPERIMENT [args...]}

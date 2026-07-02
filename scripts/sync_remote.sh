@@ -9,12 +9,13 @@ sync_remote() {
   ssh "$host" "mkdir -p $dest"
   rsync -az --delete \
     --exclude '.git/' \
+    --exclude '.venv*/' \
     --filter=':- .gitignore' \
     "$root/" "$host:$dest/"
 }
 
-HOST=${1:-hinton-01}
-REMOTE_DIR=${2:-~/code/attention-bw}
+HOST=${1:-${HOST:-hinton-01}}
+REMOTE_DIR=${2:-${REMOTE_DIR:-~/code/attention-bw}}
 sync_remote "$HOST" "$(pwd)" "$REMOTE_DIR"
 
 echo "synced $(pwd) to $HOST:$REMOTE_DIR"

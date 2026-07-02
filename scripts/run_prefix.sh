@@ -4,7 +4,7 @@ set -euo pipefail
 
 # Run one prefix-sharing sweep on the GPU host and render the throughput plot.
 # Usage: run_prefix.sh EXPERIMENT [OUT] [extra prefix_main.py args...]
-#   EXPERIMENT: homogeneity | prefix-length | num-groups | batch-size
+#   EXPERIMENT: homogeneity | prefix-length | num-groups | batch-size | schedule
 
 EXPERIMENT=${1:?usage: run_prefix.sh EXPERIMENT [OUT] [args...]}
 shift

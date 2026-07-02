@@ -14,7 +14,7 @@ There are two benchmark suites:
   Use this to see where time and bandwidth go across the whole model (attention, linear
   layers, norms, etc.).
 - **`prefix_bw`** — reproduces the prefix-homogeneity claims of the *Feather* paper
-  ("Requests of a Feather Must Flock Together", `Cache_aware_LLM_batching.pdf`) on vLLM with
+  ("Requests of a Feather Must Flock Together") on vLLM with
   prefix caching. Builds batches of requests that physically share KV-cache prefixes and
   measures how decode throughput and DRAM bandwidth change with homogeneity, shared-prefix
   length, number of prefix groups, and batch size.
@@ -109,7 +109,8 @@ scripts/install_vllm_remote.sh        # uv pip install vllm on the remote
 ```
 
 Each subcommand sweeps one knob and writes a throughput CSV + plot. The `EXPERIMENT` is one of
-`homogeneity` (Fig 4), `prefix-length` (Fig 5), `num-groups` (Fig 6), `batch-size` (Figs 8–9):
+`homogeneity` (Fig 4), `prefix-length` (Fig 5), `num-groups` (Fig 6), `batch-size` (Figs 8–9),
+or `schedule` (current mixed scheduling vs prefix-grouped scheduling):
 
 ```bash
 # Fig 4: vary the fraction of requests on a shared prefix (homogeneous beta=0/1 vs mixed)
@@ -123,7 +124,29 @@ scripts/run_prefix_remote.sh num-groups --values 1,2,4,8,16,32
 
 # Figs 8-9: sweep batch size for homogeneous vs heterogeneous workloads (two lines)
 scripts/run_prefix_remote.sh batch-size --values 16,32,64,128,256 --hetero-groups 5
+
+# Scheduler intervention: compare current all-at-once batching against prefix-local schedules
+scripts/run_prefix_remote.sh schedule --values 1,2,4,8,16 --prefix-len 4096 --decode-tokens 128
 ```
+
+All sweep commands accept
+`--schedule single|prefix-grouped|prefix-adaptive|prefix-hash-adaptive|prefix-hash-auto|offline-prefix-wave`.
+`single` is the original all-at-once benchmark. `prefix-grouped` and `prefix-adaptive` are oracle
+baselines that use the synthetic workload's known prefix-group IDs. `prefix-grouped` runs each
+same-prefix group as a homogeneous microbatch, capped by `--prefix-batch-size` or `--max-num-seqs`.
+`prefix-adaptive` only splits out prefix groups with at least `--min-prefix-batch-size` requests and
+leaves smaller groups in a residual mixed batch.
+
+`prefix-hash-adaptive` is the non-oracle scheduler. It discovers shared-prefix groups from the
+prompt token IDs using fixed-size prefix chunks (`--prefix-hash-chunk-size`) and only isolates groups
+whose discovered shared prefix is at least `--min-shared-prefix-len` and whose group size is at
+least `--min-prefix-batch-size`. This is a lightweight Chunked Hash Tree-style scheduler for testing
+the Feather idea without using synthetic group labels.
+
+`prefix-hash-auto` uses the same non-oracle grouping, but falls back to `single` when the generated
+waves would be too underfilled. `offline-prefix-wave` is a more conservative planner that estimates
+whether the saved shared-prefix work is large enough to justify extra generate calls before it splits
+the workload.
 
 To verify the **bandwidth** claim directly (not just throughput), profile a single config under
 nsys and render the DRAM-bandwidth timeline (reusing the `llm_bw` nsys visualizer). Pass one
@@ -136,7 +159,9 @@ scripts/run_prefix_nsys_remote.sh homogeneity --values 0.5   # mixed: lower BW
 
 Common knobs (all subcommands): `--model` (registry key or raw HF id), `--dtype`,
 `--num-requests`, `--decode-tokens`, `--max-num-seqs` (vLLM batch size),
-`--gpu-memory-utilization`, `--values` (the sweep points), `--no-warmup`. The measured
+`--gpu-memory-utilization`, `--values` (the sweep points), `--schedule`, `--prefix-batch-size`,
+`--min-prefix-batch-size`, `--prefix-hash-chunk-size`, `--min-shared-prefix-len`, `--no-warmup`.
+The measured
 `generate` is wrapped in `prefix_bw:...:case` NVTX ranges (with `...:warmup` around prefix-cache
 warmup) so the nsys visualizer isolates decode, exactly like `llm_bw`. Defaults are scaled down
 from the paper (which used Llama-3-8B with 10K-token prefixes); raise `--prefix-len` /

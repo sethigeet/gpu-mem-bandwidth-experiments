@@ -14,6 +14,8 @@ import gc
 import sys
 from pathlib import Path
 
+from prefix_bw.scheduler import SCHEDULES
+
 
 def _resolve_model(name: str) -> str:
     from prefix_bw.models import MODEL_REGISTRY
@@ -29,6 +31,10 @@ def _parse_ints(text: str) -> list[int]:
     return [int(v) for v in text.split(",") if v.strip()]
 
 
+def _parse_strings(text: str) -> list[str]:
+    return [v.strip() for v in text.split(",") if v.strip()]
+
+
 def _write_csv(rows: list[dict], output: Path) -> None:
     if not rows:
         print("No results to write", file=sys.stderr)
@@ -39,6 +45,20 @@ def _write_csv(rows: list[dict], output: Path) -> None:
         writer.writeheader()
         writer.writerows(rows)
     print(f"Wrote {len(rows)} rows to {output}")
+
+
+def _scheduler_kwargs(args: argparse.Namespace) -> dict:
+    return {
+        "schedule": args.schedule,
+        "prefix_batch_size": args.prefix_batch_size,
+        "min_prefix_batch_size": args.min_prefix_batch_size,
+        "prefix_hash_chunk_size": args.prefix_hash_chunk_size,
+        "min_shared_prefix_len": args.min_shared_prefix_len,
+        "prefix_auto_min_fill": args.prefix_auto_min_fill,
+        "offline_prefix_min_gain": args.offline_prefix_min_gain,
+        "offline_prefix_min_fill": args.offline_prefix_min_fill,
+        "offline_prefix_max_waves": args.offline_prefix_max_waves,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -60,6 +80,59 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument("--seed", type=int, default=0)
         p.add_argument("--no-warmup", action="store_true", help="Skip prefix-cache warmup")
+        p.add_argument(
+            "--schedule",
+            choices=SCHEDULES,
+            default="single",
+            help="Request scheduling strategy: current all-at-once run or prefix-homogeneous microbatches",
+        )
+        p.add_argument(
+            "--prefix-batch-size",
+            type=int,
+            help="Maximum requests per prefix-grouped microbatch; defaults to --max-num-seqs",
+        )
+        p.add_argument(
+            "--min-prefix-batch-size",
+            type=int,
+            default=64,
+            help="Minimum same-prefix group size to split out under prefix-adaptive scheduling",
+        )
+        p.add_argument(
+            "--prefix-hash-chunk-size",
+            type=int,
+            default=64,
+            help="Token chunk size for non-oracle prefix-hash-adaptive scheduling",
+        )
+        p.add_argument(
+            "--min-shared-prefix-len",
+            type=int,
+            default=128,
+            help="Minimum discovered shared-prefix length for prefix-hash-adaptive scheduling",
+        )
+        p.add_argument(
+            "--prefix-auto-min-fill",
+            type=float,
+            default=0.20,
+            help="Minimum split-batch fill ratio for prefix-hash-auto scheduling",
+        )
+        p.add_argument(
+            "--offline-prefix-min-gain",
+            type=float,
+            default=0.10,
+            help="Minimum estimated net gain before offline-prefix-wave departs from vLLM-style batching",
+        )
+        p.add_argument(
+            "--offline-prefix-min-fill",
+            type=float,
+            default=0.20,
+            help="Minimum total wave fill before offline-prefix-wave splits into prefix-local waves",
+        )
+        p.add_argument(
+            "--offline-prefix-max-waves",
+            type=int,
+            default=0,
+            help="Maximum generated waves for offline-prefix-wave; 0 means unlimited",
+        )
         p.add_argument("--output", "-o", type=Path, required=True, help="Output CSV path")
 
     homo = sub.add_parser("homogeneity", help="Experiment 1 / Fig 4: vary prefix homogeneity")
@@ -85,6 +158,18 @@ def build_parser() -> argparse.ArgumentParser:
     bs.add_argument("--prefix-len", type=int, default=2048)
     bs.add_argument("--suffix-len", type=int, default=32)
     bs.add_argument("--hetero-groups", type=int, default=5, help="Prefix groups in heterogeneous run")
+
+    sched = sub.add_parser("schedule", help="Compare current mixed batching with prefix-grouped scheduling")
+    add_common(sched)
+    sched.add_argument("--values", type=_parse_ints, default=_parse_ints("1,2,4,8,16"))
+    sched.add_argument("--prefix-len", type=int, default=2048)
+    sched.add_argument("--suffix-len", type=int, default=32)
+    sched.add_argument(
+        "--schedules",
+        type=_parse_strings,
+        default=_parse_strings("single,prefix-adaptive,prefix-grouped"),
+        help="Comma-separated scheduling strategies to compare",
+    )
 
     viz = sub.add_parser("visualize", help="Plot a sweep CSV or an nsys .sqlite")
     viz.add_argument("input", type=Path)
@@ -131,6 +216,7 @@ def run_homogeneity(args: argparse.Namespace) -> int:
             args.decode_tokens,
             args.max_num_seqs,
             warmup=not args.no_warmup,
+            **_scheduler_kwargs(args),
         )
         print(f"  decode throughput = {result.decode_throughput_toks_s:.1f} toks/s", flush=True)
         rows.append(result_to_row(result))
@@ -168,6 +254,7 @@ def run_prefix_length(args: argparse.Namespace) -> int:
             args.decode_tokens,
             args.max_num_seqs,
             warmup=not args.no_warmup,
+            **_scheduler_kwargs(args),
         )
         print(f"  decode throughput = {result.decode_throughput_toks_s:.1f} toks/s", flush=True)
         rows.append(result_to_row(result))
@@ -205,6 +292,7 @@ def run_num_groups(args: argparse.Namespace) -> int:
             args.decode_tokens,
             args.max_num_seqs,
             warmup=not args.no_warmup,
+            **_scheduler_kwargs(args),
         )
         print(f"  decode throughput = {result.decode_throughput_toks_s:.1f} toks/s", flush=True)
         rows.append(result_to_row(result))
@@ -250,10 +338,63 @@ def run_batch_size(args: argparse.Namespace) -> int:
                 batch,
                 series=series,
                 warmup=not args.no_warmup,
+                **_scheduler_kwargs(args),
             )
             print(f"  decode throughput = {result.decode_throughput_toks_s:.1f} toks/s", flush=True)
             rows.append(result_to_row(result))
 
+        del llm
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    _write_csv(rows, args.output)
+    return 0
+
+
+def run_schedule(args: argparse.Namespace) -> int:
+    unknown_schedules = sorted(set(args.schedules) - set(SCHEDULES))
+    if unknown_schedules:
+        print(f"Unknown schedules: {', '.join(unknown_schedules)}", file=sys.stderr)
+        return 1
+
+    _ensure_cuda()
+    import torch
+
+    from prefix_bw import workload
+    from prefix_bw.runner import build_llm, get_vocab_size, result_to_row, run_workload
+
+    max_model_len = args.prefix_len + args.suffix_len + args.decode_tokens + 16
+
+    rows = []
+    for schedule in args.schedules:
+        llm = build_llm(
+            _resolve_model(args.model),
+            args.dtype,
+            max_model_len,
+            args.max_num_seqs,
+            args.gpu_memory_utilization,
+            args.trust_remote_code,
+        )
+        vocab = get_vocab_size(llm)
+        for n_groups in args.values:
+            wl = workload.build_num_groups(
+                n_groups, args.num_requests, args.prefix_len, args.suffix_len, vocab, args.seed
+            )
+            print(f"[schedule] groups={n_groups} schedule={schedule}: {wl.description}", flush=True)
+            result = run_workload(
+                llm,
+                wl,
+                "schedule",
+                "num_groups",
+                n_groups,
+                args.decode_tokens,
+                args.max_num_seqs,
+                series=schedule,
+                warmup=not args.no_warmup,
+                **(_scheduler_kwargs(args) | {"schedule": schedule}),
+            )
+            print(f"  decode throughput = {result.decode_throughput_toks_s:.1f} toks/s", flush=True)
+            rows.append(result_to_row(result))
         del llm
         gc.collect()
         torch.cuda.empty_cache()
@@ -287,6 +428,7 @@ def main(argv: list[str] | None = None) -> int:
         "prefix-length": run_prefix_length,
         "num-groups": run_num_groups,
         "batch-size": run_batch_size,
+        "schedule": run_schedule,
         "visualize": run_visualize,
     }
     handler = dispatch.get(args.command)

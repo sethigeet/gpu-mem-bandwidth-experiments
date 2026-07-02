@@ -15,6 +15,7 @@ _TITLES = {
     "shared_length": "Shared Prefix Length vs Decode Throughput (Fig 5)",
     "num_groups": "Number of Prefix Groups vs Decode Throughput (Fig 6)",
     "batch_size": "Batch Size vs Throughput: Homogeneous vs Heterogeneous (Figs 8-9)",
+    "schedule": "Scheduling Strategy vs Decode Throughput",
 }
 
 
