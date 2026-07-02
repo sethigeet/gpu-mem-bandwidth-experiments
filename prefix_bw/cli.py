@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import random
 import sys
 from pathlib import Path
 
@@ -39,6 +40,30 @@ def _write_csv(rows: list[dict], output: Path) -> None:
         writer.writeheader()
         writer.writerows(rows)
     print(f"Wrote {len(rows)} rows to {output}")
+
+
+def _parse_strings(text: str) -> list[str]:
+    return [v.strip() for v in text.split(",") if v.strip()]
+
+
+def _reorder_by_prefix_group(wl, num_groups: int, order: str, seed: int):
+    from prefix_bw.workload import Workload
+
+    indexed = list(enumerate(wl.requests))
+    if order == "stock_random":
+        random.Random(f"{seed}:stock_random").shuffle(indexed)
+    elif order in {"prefix_grouped", "grouped_contiguous_hint"}:
+        indexed.sort(key=lambda item: (item[0] % num_groups, item[0]))
+    else:
+        raise ValueError(f"unknown locality order: {order}")
+
+    return Workload(
+        name=f"{wl.name}_{order}",
+        requests=[request for _, request in indexed],
+        shared_prefixes=wl.shared_prefixes,
+        description=f"{wl.description}, order={order}",
+        params={**wl.params, "order": order},
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,6 +110,18 @@ def build_parser() -> argparse.ArgumentParser:
     bs.add_argument("--prefix-len", type=int, default=2048)
     bs.add_argument("--suffix-len", type=int, default=32)
     bs.add_argument("--hetero-groups", type=int, default=5, help="Prefix groups in heterogeneous run")
+
+    locality = sub.add_parser("locality", help="Compare stock vs prefix-aware vs contiguity-friendly batching")
+    add_common(locality)
+    locality.add_argument("--num-groups", type=int, default=8)
+    locality.add_argument("--prefix-len", type=int, default=2048)
+    locality.add_argument("--suffix-len", type=int, default=32)
+    locality.add_argument(
+        "--variants",
+        type=_parse_strings,
+        default=_parse_strings("stock_random,prefix_grouped,grouped_contiguous_hint"),
+        help="Comma-separated variants: stock_random,prefix_grouped,grouped_contiguous_hint",
+    )
 
     viz = sub.add_parser("visualize", help="Plot a sweep CSV or an nsys .sqlite")
     viz.add_argument("input", type=Path)
@@ -262,6 +299,60 @@ def run_batch_size(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_locality(args: argparse.Namespace) -> int:
+    _ensure_cuda()
+    import torch
+
+    from prefix_bw import workload
+    from prefix_bw.runner import build_llm, get_vocab_size, result_to_row, run_workload
+
+    max_model_len = args.prefix_len + args.suffix_len + args.decode_tokens + 16
+    rows = []
+
+    for variant_id, variant in enumerate(args.variants):
+        print(f"[locality] variant={variant}", flush=True)
+        llm = build_llm(
+            _resolve_model(args.model),
+            args.dtype,
+            max_model_len,
+            args.max_num_seqs,
+            args.gpu_memory_utilization,
+            args.trust_remote_code,
+        )
+        vocab = get_vocab_size(llm)
+        base = workload.build_num_groups(
+            args.num_groups, args.num_requests, args.prefix_len, args.suffix_len, vocab, args.seed
+        )
+        wl = _reorder_by_prefix_group(base, args.num_groups, variant, args.seed)
+
+        # This variant warms full prompts in prefix-grouped order, nudging vLLM's
+        # prefix cache allocator toward physically adjacent KV blocks for each group.
+        warmup_requests = wl.requests if variant == "grouped_contiguous_hint" else None
+        result = run_workload(
+            llm,
+            wl,
+            "locality",
+            "variant_id",
+            float(variant_id),
+            args.decode_tokens,
+            args.max_num_seqs,
+            series=variant,
+            warmup=not args.no_warmup,
+            warmup_requests=warmup_requests,
+        )
+        print(f"  decode throughput = {result.decode_throughput_toks_s:.1f} toks/s", flush=True)
+        row = result_to_row(result)
+        row["variant"] = variant
+        rows.append(row)
+
+        del llm
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    _write_csv(rows, args.output)
+    return 0
+
+
 def run_visualize(args: argparse.Namespace) -> int:
     if not args.input.exists():
         print(f"Error: {args.input} not found", file=sys.stderr)
@@ -287,6 +378,7 @@ def main(argv: list[str] | None = None) -> int:
         "prefix-length": run_prefix_length,
         "num-groups": run_num_groups,
         "batch-size": run_batch_size,
+        "locality": run_locality,
         "visualize": run_visualize,
     }
     handler = dispatch.get(args.command)

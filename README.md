@@ -18,6 +18,9 @@ There are two benchmark suites:
   prefix caching. Builds batches of requests that physically share KV-cache prefixes and
   measures how decode throughput and DRAM bandwidth change with homogeneity, shared-prefix
   length, number of prefix groups, and batch size.
+- **`vllm_bw`** — profiles a standard `vllm serve` OpenAI-compatible server while
+  `vllm bench serve` sends many requests. Use this to answer whether a realistic serving run is
+  saturating DRAM during decode-heavy request load or leaving memory-bandwidth headroom.
 
 The local machine is assumed to have **no GPU**. Everything that needs CUDA runs on a remote
 host over SSH; the `*_remote.sh` scripts sync the repo, run the profiler remotely, render the
@@ -141,6 +144,45 @@ Common knobs (all subcommands): `--model` (registry key or raw HF id), `--dtype`
 warmup) so the nsys visualizer isolates decode, exactly like `llm_bw`. Defaults are scaled down
 from the paper (which used Llama-3-8B with 10K-token prefixes); raise `--prefix-len` /
 `--total-len` / `--num-requests` toward those to match it more closely.
+
+## vllm_bw — vLLM serving under request load
+
+Runs `vllm serve` under Nsight Systems, waits for `/health`, warms the server with a small
+`vllm bench serve` run, then wraps the measured benchmark in an NVTX range named
+`vllm_bw:serve:bench`. The visualizer filters the exported SQLite to that range so startup,
+model load, and warmup do not dilute the DRAM-bandwidth numbers.
+
+```bash
+# Start a standard serving profile on the remote GPU host in detached tmux.
+scripts/run_vllm_serve_nsys_remote.sh hinton-01 ~/code/attention-bw \
+  --model phi-3-mini \
+  --random-input-len 2048 \
+  --random-output-len 64 \
+  --num-prompts 256 \
+  --max-num-seqs 256 \
+  --request-rate inf
+
+# The start command prints the output prefix. Fetch artifacts after tmux finishes.
+scripts/fetch_vllm_serve_nsys_remote.sh hinton-01 ~/code/attention-bw \
+  results/vllm_bw_serve_nsys_<ts>
+```
+
+The wrapper writes:
+
+- `results/vllm_bw_serve_nsys_<ts>.png` — DRAM and SM utilization timelines for the measured
+  request-load window.
+- `results/vllm_bw_serve_nsys_<ts>_summary.csv` — per-metric average, p50, p95, max, and
+  `headroom_vs_p95_pct`.
+- `results/vllm_bw_serve_nsys_<ts>_logs/bench.log` — `vllm bench serve` throughput, TTFT, TPOT,
+  and inter-token-latency output.
+
+Interpretation: if DRAM p95 is close to sustained peak while SM activity is materially lower,
+decode is behaving as memory-bound and remaining gains likely need better memory locality,
+batching, KV-cache layout, or quantization. If DRAM p95 is far below peak during the measured
+window, there is likely serving/runtime overhead, insufficient concurrency, model-size effects,
+or another bottleneck leaving bandwidth on the table. Increase `--num-prompts`,
+`--max-num-seqs`, or `--max-concurrency` to push harder before concluding the kernel path itself
+is not bandwidth-limited.
 
 ## Profiling details
 

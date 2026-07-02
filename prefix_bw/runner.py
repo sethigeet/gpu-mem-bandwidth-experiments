@@ -76,6 +76,7 @@ def run_workload(
     max_num_seqs: int,
     series: str = "main",
     warmup: bool = True,
+    warmup_requests: list[list[int]] | None = None,
 ) -> RunResult:
     from vllm import SamplingParams  # ty: ignore[unresolved-import]
 
@@ -84,12 +85,13 @@ def run_workload(
     # Warmup: prefill the distinct shared prefixes so their KV blocks are resident in
     # the prefix cache before the measured run. This mirrors the paper's methodology of
     # holding per-token compute constant so differences come from memory access patterns.
-    if warmup and workload.shared_prefixes:
+    warmup_prompts = warmup_requests if warmup_requests is not None else workload.shared_prefixes
+    if warmup and warmup_prompts:
         torch.cuda.nvtx.range_push(f"prefix_bw:{label}:warmup")
         try:
             warm_params = SamplingParams(max_tokens=1, temperature=0.0)
             llm.generate(
-                [{"prompt_token_ids": p} for p in workload.shared_prefixes],
+                [{"prompt_token_ids": p} for p in warmup_prompts],
                 warm_params,
                 use_tqdm=False,
             )
