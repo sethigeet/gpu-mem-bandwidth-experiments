@@ -97,6 +97,61 @@ scripts/run_llm_nsys_remote.sh hinton-01 --model mistral-7b --attention flash_at
 > NCU runs every kernel multiple times to collect counters, so it is slow. The LLM NCU wrapper
 > caps decode to 1 token; keep token counts small when profiling with `ncu`.
 
+## component_bw — staged synthetic decode ladder
+
+Builds the missing pieces between isolated attention and vLLM with PyTorch modules shaped like
+Phi-3-mini by default. Each stage runs the same long shared-prefix decode shape and reports
+decode throughput plus estimated KV bytes and launch count. Nsight ranges use
+`component_bw:<stage>:case|warmup|iter`.
+
+Stages:
+
+- `attention_kernel` — direct SDPA decode over preallocated KV.
+- `attention_layer` — QKV/O projections plus SDPA.
+- `mlp` — gated MLP only.
+- `block` — RMSNorm, attention, residuals, and MLP for one decoder block.
+- `blocks` — repeated decoder blocks.
+- `model` — embeddings, all blocks, final norm, lm head, and argmax sampling.
+- `paged_attention` — attention layer with a PyTorch block-table KV gather.
+- `paged_model` — full synthetic model with the same paged-KV approximation.
+
+Run a small remote smoke test first:
+
+```bash
+scripts/run_component_nsys_remote.sh hinton-01 ~/code/attention-bw \
+  --smoke \
+  --stages attention_kernel attention_layer mlp block paged_attention
+```
+
+Run the canonical 10K shared-prefix matrix:
+
+```bash
+scripts/run_component_nsys_remote_tmux.sh hinton-01 ~/code/attention-bw \
+  --model phi-3-mini \
+  --prefix-len 10000 \
+  --decode-tokens 64 \
+  --batch-size auto \
+  --max-auto-batch 256 \
+  --layout shared
+```
+
+The tmux launcher prints a `scripts/fetch_component_nsys_remote.sh ...` command to copy artifacts
+back after the detached session finishes.
+
+Profile one stage with Nsight Compute counters:
+
+```bash
+scripts/run_component_ncu_remote.sh hinton-01 ~/code/attention-bw \
+  --stage attention_kernel \
+  --prefix-len 10000 \
+  --batch-size auto \
+  --layout shared
+```
+
+The NSYS wrapper writes `results/component_bw_nsys_<ts>.csv` for throughput,
+`_summary.png` for the stage waterfall, `.png` for DRAM/SM timelines, and
+`_nsys_summary.csv` with average/p50/p95/max utilization inside the measured component ranges.
+
 ## prefix_bw — Feather prefix-homogeneity reproduction
 
 Reproduces the paper's claim that, because decode is memory-bandwidth bound, batches whose
