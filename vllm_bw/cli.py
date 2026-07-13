@@ -4,6 +4,10 @@ import argparse
 import sys
 from pathlib import Path
 
+from vllm_bw.scheduling_compare import (
+    add_scheduling_compare_args,
+    run_scheduling_comparison,
+)
 from vllm_bw.serve_profile import (
     add_client_nsys_profile_args,
     add_serve_profile_args,
@@ -26,6 +30,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run vLLM serve normally and profile only the request-load client with nsys",
     )
     add_client_nsys_profile_args(client_nsys)
+
+    scheduling_compare = subparsers.add_parser(
+        "scheduling-compare",
+        help="Compare explicit async and sync scheduling with paired NSYS trials",
+    )
+    add_scheduling_compare_args(scheduling_compare)
 
     visualize = subparsers.add_parser("visualize", help="Visualize an nsys SQLite export")
     visualize.add_argument("input", type=Path)
@@ -57,6 +67,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_serve_profile(args)
     if args.command == "client-nsys":
         return run_client_nsys_profile(args)
+    if args.command == "scheduling-compare":
+        return run_scheduling_comparison(args)
     if args.command == "visualize":
         if not args.input.exists():
             print(f"Error: {args.input} not found", file=sys.stderr)

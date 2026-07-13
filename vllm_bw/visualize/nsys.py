@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -9,6 +10,26 @@ import pandas as pd
 
 MEASURED_RANGE_PATTERN = r"vllm_bw:serve:bench"
 MAX_PLOT_METRIC_ROWS = 200_000
+
+
+@dataclass(frozen=True)
+class DramUtilization:
+    avg_pct: float
+    p95_pct: float
+    samples: int
+    metric_names: tuple[str, ...]
+
+
+def _as_float(value: object) -> float:
+    if isinstance(value, int | float | str):
+        return float(value)
+    raise TypeError(f"Expected a numeric value, got {value!r}")
+
+
+def _as_int(value: object) -> int:
+    if isinstance(value, int | float | str):
+        return int(value)
+    raise TypeError(f"Expected an integer value, got {value!r}")
 
 
 def _relevant_metric_clause(alias: str = "i") -> str:
@@ -87,15 +108,26 @@ def load_nsys_metrics(path: Path, measured_only: bool = True) -> tuple[pd.DataFr
 
     metrics = pd.read_sql_query(
         """
-        SELECT m.timestamp, m.metricId, CAST(m.value AS REAL) as value, i.metricName as metric_name
-        FROM GPU_METRICS m
-        JOIN TARGET_INFO_GPU_METRICS i ON m.metricId = i.metricId
-        WHERE
+        WITH relevant_metrics AS (
+            SELECT
+                m.timestamp,
+                m.metricId,
+                CAST(m.value AS REAL) AS value,
+                i.metricName AS metric_name,
+                ROW_NUMBER() OVER (
+                    PARTITION BY m.metricId ORDER BY m.timestamp
+                ) AS sample_number
+            FROM GPU_METRICS m
+            JOIN TARGET_INFO_GPU_METRICS i ON m.metricId = i.metricId
+            WHERE
         """
         + _relevant_metric_clause("i")
         + """
-          AND (m.rowid % ? = 0)
-        ORDER BY m.timestamp
+        )
+        SELECT timestamp, metricId, value, metric_name
+        FROM relevant_metrics
+        WHERE ((sample_number - 1) % ?) = 0
+        ORDER BY timestamp
         """,
         conn,
         params=[stride],
@@ -260,6 +292,58 @@ def summarize_nsys(path: Path, measured_only: bool = True) -> list[dict[str, obj
         )
 
     return rows
+
+
+def extract_dram_utilization(
+    path: Path,
+    measured_only: bool = False,
+    *,
+    trim_idle_edges: bool = False,
+) -> DramUtilization:
+    if trim_idle_edges:
+        metrics, _, _ = load_nsys_metrics(path, measured_only=measured_only)
+        dram = _metric_subset(metrics, "DRAM")
+        throughput = dram[dram["metric_name"].str.contains("throughput", case=False, na=False)]
+        if not throughput.empty:
+            dram = throughput
+        active = dram[dram["value"].astype(float) > 0]
+        if active.empty:
+            raise ValueError(f"No active DRAM utilization samples found in {path}")
+        start = active["timestamp"].min()
+        end = active["timestamp"].max()
+        dram = dram[(dram["timestamp"] >= start) & (dram["timestamp"] <= end)]
+        values = dram["value"].astype(float)
+        return DramUtilization(
+            avg_pct=float(values.mean()),
+            p95_pct=float(values.quantile(0.95)),
+            samples=int(values.size),
+            metric_names=tuple(str(name) for name in dram["metric_name"].unique()),
+        )
+
+    rows = summarize_nsys(path, measured_only=measured_only)
+    dram_rows = [
+        row
+        for row in rows
+        if "dram" in str(row["metric_name"]).lower() and "throughput" in str(row["metric_name"]).lower()
+    ]
+    if not dram_rows:
+        dram_rows = [row for row in rows if "dram" in str(row["metric_name"]).lower()]
+    if not dram_rows:
+        raise ValueError(f"No DRAM utilization metric found in {path}")
+
+    sample_count = sum(_as_int(row["samples"]) for row in dram_rows)
+    if sample_count <= 0:
+        raise ValueError(f"DRAM metrics in {path} contain no samples")
+
+    def weighted(field: str) -> float:
+        return sum(_as_float(row[field]) * _as_int(row["samples"]) for row in dram_rows) / sample_count
+
+    return DramUtilization(
+        avg_pct=weighted("avg_pct"),
+        p95_pct=weighted("p95_pct"),
+        samples=sample_count,
+        metric_names=tuple(str(row["metric_name"]) for row in dram_rows),
+    )
 
 
 def write_summary_csv(rows: list[dict[str, object]], output: Path) -> None:

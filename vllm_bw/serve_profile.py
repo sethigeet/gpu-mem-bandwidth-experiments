@@ -111,10 +111,22 @@ def _server_command(args: argparse.Namespace, model: str) -> list[str]:
     ]
     if args.trust_remote_code:
         cmd.append("--trust-remote-code")
+    scheduling_mode = getattr(args, "scheduling_mode", None)
+    if scheduling_mode == "async":
+        cmd.append("--async-scheduling")
+    elif scheduling_mode == "sync":
+        cmd.append("--no-async-scheduling")
     return cmd
 
 
-def _bench_command(args: argparse.Namespace, model: str, num_prompts: int) -> list[str]:
+def _bench_command(
+    args: argparse.Namespace,
+    model: str,
+    num_prompts: int,
+    *,
+    result_path: Path | None = None,
+    metadata: dict[str, object] | None = None,
+) -> list[str]:
     cmd = [
         _vllm_executable(),
         "bench",
@@ -142,14 +154,30 @@ def _bench_command(args: argparse.Namespace, model: str, num_prompts: int) -> li
         "--seed",
         str(args.seed),
     ]
+    if args.random_prefix_len > 0:
+        cmd.extend(["--random-prefix-len", str(args.random_prefix_len)])
     if args.max_concurrency is not None:
         cmd.extend(["--max-concurrency", str(args.max_concurrency)])
     if args.ignore_eos:
         cmd.append("--ignore-eos")
+    if result_path is not None:
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd.extend(
+            [
+                "--save-result",
+                "--result-dir",
+                str(result_path.parent),
+                "--result-filename",
+                result_path.name,
+            ]
+        )
+        if metadata:
+            cmd.append("--metadata")
+            cmd.extend(f"{key}={value}" for key, value in metadata.items())
     return cmd
 
 
-def _run_and_log(cmd: list[str], log_path: Path, timeout_s: float | None = None) -> None:
+def _run_and_log(cmd: list[str], log_path: Path, timeout_s: float | None = None) -> str:
     print(f"$ {' '.join(cmd)}", flush=True)
     with log_path.open("w") as log:
         completed = subprocess.run(
@@ -164,6 +192,7 @@ def _run_and_log(cmd: list[str], log_path: Path, timeout_s: float | None = None)
     print(completed.stdout, flush=True)
     if completed.returncode != 0:
         raise subprocess.CalledProcessError(completed.returncode, cmd, output=completed.stdout)
+    return completed.stdout
 
 
 def run_serve_profile(args: argparse.Namespace) -> int:
@@ -181,10 +210,12 @@ def run_serve_profile(args: argparse.Namespace) -> int:
                 "max_model_len": args.max_model_len,
                 "max_num_seqs": args.max_num_seqs,
                 "random_input_len": args.random_input_len,
+                "random_prefix_len": args.random_prefix_len,
                 "random_output_len": args.random_output_len,
                 "num_prompts": args.num_prompts,
                 "request_rate": args.request_rate,
                 "max_concurrency": args.max_concurrency,
+                "scheduling_mode": args.scheduling_mode,
                 "nvtx_range": _MEASURED_RANGE,
             },
             indent=2,
@@ -211,7 +242,13 @@ def run_serve_profile(args: argparse.Namespace) -> int:
             warmup_cmd = _bench_command(args, model, args.warmup_prompts)
             _run_and_log(warmup_cmd, args.log_dir / "warmup.log", args.bench_timeout_s)
 
-        bench_cmd = _bench_command(args, model, args.num_prompts)
+        bench_cmd = _bench_command(
+            args,
+            model,
+            args.num_prompts,
+            result_path=args.log_dir / "bench_result.json",
+            metadata={"scheduling_mode": args.scheduling_mode or "default"},
+        )
         with _nvtx_range(_MEASURED_RANGE):
             _run_and_log(bench_cmd, args.log_dir / "bench.log", args.bench_timeout_s)
     finally:
@@ -256,7 +293,13 @@ def run_client_nsys_profile(args: argparse.Namespace) -> int:
             warmup_cmd = _bench_command(args, model, args.warmup_prompts)
             _run_and_log(warmup_cmd, args.log_dir / "warmup.log", args.bench_timeout_s)
 
-        bench_cmd = _bench_command(args, model, args.num_prompts)
+        bench_cmd = _bench_command(
+            args,
+            model,
+            args.num_prompts,
+            result_path=args.log_dir / "bench_result.json",
+            metadata={"scheduling_mode": args.scheduling_mode or "default"},
+        )
         nsys_cmd = [
             "nsys",
             "profile",
@@ -312,11 +355,22 @@ def add_serve_profile_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--bench-backend", default="openai", help="Backend passed to `vllm bench serve`")
     parser.add_argument("--endpoint", default="/v1/completions")
     parser.add_argument("--random-input-len", type=int, default=2048)
+    parser.add_argument(
+        "--random-prefix-len",
+        type=int,
+        default=0,
+        help="Token-identical prefix prepended to every random benchmark request",
+    )
     parser.add_argument("--random-output-len", type=int, default=64)
     parser.add_argument("--num-prompts", type=int, default=256)
     parser.add_argument("--warmup-prompts", type=int, default=16)
     parser.add_argument("--request-rate", default="inf")
     parser.add_argument("--max-concurrency", type=int)
+    parser.add_argument(
+        "--scheduling-mode",
+        choices=["async", "sync"],
+        help="Explicitly enable or disable vLLM asynchronous scheduling",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--ignore-eos",

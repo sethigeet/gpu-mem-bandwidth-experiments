@@ -230,6 +230,32 @@ The wrapper writes:
 - `results/vllm_bw_serve_nsys_<ts>_logs/bench.log` — `vllm bench serve` throughput, TTFT, TPOT,
   and inter-token-latency output.
 
+### Async versus sync scheduling
+
+The scheduling comparison uses one installed vLLM version and explicitly passes
+`--async-scheduling` or `--no-async-scheduling`. Every paired trial uses the same random seed,
+starts a fresh server, warms it before profiling, and alternates mode order. Run it remotely:
+
+```bash
+scripts/vllm_bw.sh compare --remote --detach \
+  --host hinton-01 --remote-dir ~/code/attention-bw -- \
+  --model phi-3-mini \
+  --random-input-len 2048 \
+  --random-output-len 64 \
+  --num-prompts 256 \
+  --max-num-seqs 256 \
+  --max-concurrency 256 \
+  --request-rate inf \
+  --repetitions 5
+```
+
+Fetch the printed output directory with `scripts/vllm_bw.sh fetch ...`. Its `impact.csv` reports
+the async-minus-sync change in output tokens/second and average DRAM bandwidth utilization.
+`trials.csv`, `summary.csv`, `paired_comparison.csv`, and `comparison.png` expose trial-level
+values and variance. DRAM utilization is the NSYS percentage of sustained peak, averaged only
+between the first and last active DRAM sample in the client benchmark; server startup and warmup
+are outside the trace.
+
 Interpretation: if DRAM p95 is close to sustained peak while SM activity is materially lower,
 decode is behaving as memory-bound and remaining gains likely need better memory locality,
 batching, KV-cache layout, or quantization. If DRAM p95 is far below peak during the measured

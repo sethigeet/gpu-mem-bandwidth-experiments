@@ -1,3 +1,13 @@
-from vllm_bw.visualize.nsys import summarize_nsys, visualize_nsys
+from vllm_bw.visualize.nsys import (
+    DramUtilization,
+    extract_dram_utilization,
+    summarize_nsys,
+    visualize_nsys,
+)
 
-__all__ = ["summarize_nsys", "visualize_nsys"]
+__all__ = [
+    "DramUtilization",
+    "extract_dram_utilization",
+    "summarize_nsys",
+    "visualize_nsys",
+]
