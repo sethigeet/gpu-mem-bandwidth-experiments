@@ -13,7 +13,7 @@ There are two benchmark suites:
 - **`llm_bw`** — a full Hugging Face transformer model running the decode phase end to end.
   Use this to see where time and bandwidth go across the whole model (attention, linear
   layers, norms, etc.).
-- **`prefix_bw`** — reproduces the prefix-homogeneity claims of the *Feather* paper
+- **`prefix_bw`** — reproduces the prefix-homogeneity claims of the _Feather_ paper
   ("Requests of a Feather Must Flock Together", `Cache_aware_LLM_batching.pdf`) on vLLM with
   prefix caching. Builds batches of requests that physically share KV-cache prefixes and
   measures how decode throughput and DRAM bandwidth change with homogeneity, shared-prefix
@@ -23,9 +23,9 @@ There are two benchmark suites:
   saturating DRAM during decode-heavy request load or leaving memory-bandwidth headroom.
 
 The local machine is assumed to have **no GPU**. Everything that needs CUDA runs on a remote
-host over SSH; the `*_remote.sh` scripts sync the repo, run the profiler remotely, render the
-plot remotely, and copy the resulting `.png` back. Locally you only need CPU/tooling
-dependencies.
+host over SSH; each suite script's `--remote` mode syncs the repo, runs the profiler remotely,
+renders the plot remotely, and copies the requested artifacts back. Locally you only need
+CPU/tooling dependencies.
 
 ## Requirements
 
@@ -47,14 +47,12 @@ uvx ty check
 
 ## Remote configuration
 
-The `*_remote.sh` scripts source `scripts/sync_remote.sh`, which takes the host and remote
-directory as its first two positional arguments.
+The suite scripts accept the same remote options: `--remote`, `--host`, and `--remote-dir`.
+Benchmark-specific arguments follow `--`. Each remote profiling run syncs the repository first.
 
 ```bash
-scripts/sync_remote.sh my-gpu-host ~/work
+scripts/remote.sh sync --host my-gpu-host --remote-dir ~/work
 ```
-
-NOTE: Each profiling run automatically re-syncs the repo first.
 
 ## attention_bw — SDPA kernel benchmark
 
@@ -63,15 +61,16 @@ is a single token `(B,H,1,D)`, the K/V cache is `(B,H,CACHE_SEQ,D)`.
 
 Kernels: `sdpa_math`, `sdpa_mem_efficient`, `sdpa_flash` (or `all`).
 
-Run remotely with the profiler wrappers (output filename is timestamped automatically;
-extra args after the host are forwarded to `main.py run`):
+Run remotely with the suite wrapper (output filename is timestamped automatically):
 
 ```bash
 # Nsight Compute (per-kernel DRAM/SM counters)
-scripts/run_ncu_remote.sh hinton-01 --kernels all --shape 2,64,4096,128 --dtype fp16
+scripts/attention_bw.sh ncu --remote --host hinton-01 -- \
+  --kernels all --shape 2,64,4096,128 --dtype fp16
 
 # Nsight Systems (GPU-metric timeline)
-scripts/run_nsys_remote.sh hinton-01 --kernels sdpa_flash --shape 1,16,4096,64
+scripts/attention_bw.sh nsys --remote --host hinton-01 -- \
+  --kernels sdpa_flash --shape 1,16,4096,64
 ```
 
 Both scripts render the plot on the remote and copy a `.png` into `results/`.
@@ -88,10 +87,12 @@ attention implementation is selectable.
 
 ```bash
 # Nsight Compute (per-layer-type breakdown)
-scripts/run_llm_ncu_remote.sh hinton-01 --model phi-3-mini --attention sdpa --prompt-length 512
+scripts/llm_bw.sh ncu --remote --host hinton-01 -- \
+  --model phi-3-mini --attention sdpa --prompt-length 512
 
 # Nsight Systems (timeline over the decode phase)
-scripts/run_llm_nsys_remote.sh hinton-01 --model mistral-7b --attention flash_attention_2
+scripts/llm_bw.sh nsys --remote --host hinton-01 -- \
+  --model mistral-7b --attention flash_attention_2
 ```
 
 > NCU runs every kernel multiple times to collect counters, so it is slow. The LLM NCU wrapper
@@ -118,7 +119,7 @@ Stages:
 Run a small remote smoke test first:
 
 ```bash
-scripts/run_component_nsys_remote.sh hinton-01 ~/code/attention-bw \
+scripts/component_bw.sh nsys --remote --host hinton-01 --remote-dir ~/code/attention-bw -- \
   --smoke \
   --stages attention_kernel attention_layer mlp block paged_attention
 ```
@@ -126,7 +127,8 @@ scripts/run_component_nsys_remote.sh hinton-01 ~/code/attention-bw \
 Run the canonical 10K shared-prefix matrix:
 
 ```bash
-scripts/run_component_nsys_remote_tmux.sh hinton-01 ~/code/attention-bw \
+scripts/component_bw.sh bundle --remote --detach \
+  --host hinton-01 --remote-dir ~/code/attention-bw -- \
   --model phi-3-mini \
   --prefix-len 10000 \
   --decode-tokens 64 \
@@ -135,13 +137,14 @@ scripts/run_component_nsys_remote_tmux.sh hinton-01 ~/code/attention-bw \
   --layout shared
 ```
 
-The tmux launcher prints a `scripts/fetch_component_nsys_remote.sh ...` command to copy artifacts
-back after the detached session finishes.
+The tmux launcher prints a `scripts/component_bw.sh fetch ...` command to copy artifacts back
+after the detached session finishes.
 
 Profile one stage with Nsight Compute counters:
 
 ```bash
-scripts/run_component_ncu_remote.sh hinton-01 ~/code/attention-bw \
+scripts/component_bw.sh ncu --remote \
+  --host hinton-01 --remote-dir ~/code/attention-bw -- \
   --stage attention_kernel \
   --prefix-len 10000 \
   --batch-size auto \
@@ -160,27 +163,22 @@ effective DRAM bandwidth, fewer bytes fetched) and so higher decode throughput. 
 built as raw token-id lists; identical leading tokens make vLLM's prefix cache store the shared
 prefix once and let every request in the group read the same KV blocks.
 
-vLLM is a GPU-host-only dependency. Install it once into the remote venv:
-
-```bash
-scripts/install_vllm_remote.sh        # uv pip install vllm on the remote
-```
-
 Each subcommand sweeps one knob and writes a throughput CSV + plot. The `EXPERIMENT` is one of
 `homogeneity` (Fig 4), `prefix-length` (Fig 5), `num-groups` (Fig 6), `batch-size` (Figs 8–9):
 
 ```bash
 # Fig 4: vary the fraction of requests on a shared prefix (homogeneous beta=0/1 vs mixed)
-scripts/run_prefix_remote.sh homogeneity --model llama-7b --num-requests 256
+scripts/prefix_bw.sh sweep homogeneity --remote -- --model llama-7b --num-requests 256
 
 # Fig 5: vary the shared prefix length
-scripts/run_prefix_remote.sh prefix-length --total-len 4096
+scripts/prefix_bw.sh sweep prefix-length --remote -- --total-len 4096
 
 # Fig 6: vary the number of distinct prefix groups
-scripts/run_prefix_remote.sh num-groups --values 1,2,4,8,16,32
+scripts/prefix_bw.sh sweep num-groups --remote -- --values 1,2,4,8,16,32
 
 # Figs 8-9: sweep batch size for homogeneous vs heterogeneous workloads (two lines)
-scripts/run_prefix_remote.sh batch-size --values 16,32,64,128,256 --hetero-groups 5
+scripts/prefix_bw.sh sweep batch-size --remote -- \
+  --values 16,32,64,128,256 --hetero-groups 5
 ```
 
 To verify the **bandwidth** claim directly (not just throughput), profile a single config under
@@ -188,8 +186,8 @@ nsys and render the DRAM-bandwidth timeline (reusing the `llm_bw` nsys visualize
 sweep value so the timeline is clean — e.g. fully homogeneous vs mixed:
 
 ```bash
-scripts/run_prefix_nsys_remote.sh homogeneity --values 1.0   # homogeneous: high BW
-scripts/run_prefix_nsys_remote.sh homogeneity --values 0.5   # mixed: lower BW
+scripts/prefix_bw.sh nsys homogeneity --remote -- --values 1.0  # homogeneous: high BW
+scripts/prefix_bw.sh nsys homogeneity --remote -- --values 0.5  # mixed: lower BW
 ```
 
 Common knobs (all subcommands): `--model` (registry key or raw HF id), `--dtype`,
@@ -209,7 +207,8 @@ model load, and warmup do not dilute the DRAM-bandwidth numbers.
 
 ```bash
 # Start a standard serving profile on the remote GPU host in detached tmux.
-scripts/run_vllm_serve_nsys_remote.sh hinton-01 ~/code/attention-bw \
+scripts/vllm_bw.sh profile serve --remote --detach \
+  --host hinton-01 --remote-dir ~/code/attention-bw -- \
   --model phi-3-mini \
   --random-input-len 2048 \
   --random-output-len 64 \
@@ -218,8 +217,8 @@ scripts/run_vllm_serve_nsys_remote.sh hinton-01 ~/code/attention-bw \
   --request-rate inf
 
 # The start command prints the output prefix. Fetch artifacts after tmux finishes.
-scripts/fetch_vllm_serve_nsys_remote.sh hinton-01 ~/code/attention-bw \
-  results/vllm_bw_serve_nsys_<ts>
+scripts/vllm_bw.sh fetch --host hinton-01 --remote-dir ~/code/attention-bw \
+  --out results/vllm_bw_serve_nsys_<ts>
 ```
 
 The wrapper writes:
@@ -271,9 +270,9 @@ timeline view.
 
 ## Running directly on a GPU host
 
-The `*_remote.sh` scripts are thin wrappers around `scripts/run_{ncu,nsys}.sh` and
-`scripts/run_llm_{ncu,nsys}.sh`. On a machine that already has a GPU you can invoke those (or
-`main.py` / `llm_main.py`) directly:
+Omit `--remote` to use any suite script directly on a GPU host. The scripts are grouped by
+benchmark: `attention_bw.sh`, `llm_bw.sh`, `component_bw.sh`, `prefix_bw.sh`, and `vllm_bw.sh`.
+The Python entry points remain available:
 
 ```bash
 uv run main.py run --kernels all --shape 2,64,4096,128
