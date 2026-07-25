@@ -36,6 +36,9 @@ if [[ "$COMMAND" == "install-policies" ]]; then
     python3 -m vllm_bw.policy_fork
     "${COMMON_EXTRA[@]}"
   )
+  if [[ -n ${WAIT_FOR_TMUX_SESSION:-} ]]; then
+    INSTALL_ARGS+=(--wait-for-tmux-session "$WAIT_FOR_TMUX_SESSION")
+  fi
   if [[ "$COMMON_DETACH" == true ]]; then
     SESSION=${TMUX_SESSION:-vllm_bw_install_policies_${TIMESTAMP}}
     LOG="results/vllm_policy_install_${TIMESTAMP}.remote.log"
@@ -95,7 +98,13 @@ if [[ "$COMMON_REMOTE" == true ]]; then
   sync_project "$COMMON_HOST" "$COMMON_REMOTE_DIR"
   REMOTE_DIR_ABS=$(resolve_remote_dir "$COMMON_HOST" "$COMMON_REMOTE_DIR")
   REMOTE_ENV=(env)
-  for variable in VLLM_ATTENTION_BACKEND HF_HUB_OFFLINE HF_HOME WAIT_FOR_TMUX_SESSION; do
+  for variable in \
+    VLLM_ATTENTION_BACKEND \
+    VLLM_BW_PROFILE_INTERVAL \
+    VLLM_BW_PROFILE_SCHEDULER \
+    HF_HUB_OFFLINE \
+    HF_HOME \
+    WAIT_FOR_TMUX_SESSION; do
     if [[ -v "$variable" ]]; then
       REMOTE_ENV+=("$variable=${!variable}")
     fi

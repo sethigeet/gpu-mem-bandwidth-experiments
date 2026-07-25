@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 VENDORED_SCHEDULERS = Path(__file__).with_name("schedulers")
@@ -123,6 +124,17 @@ def _configure_scheduler(vllm_source: Path) -> None:
     scheduler_path = vllm_source / "vllm/v1/core/sched/scheduler.py"
     text = scheduler_path.read_text()
 
+    timing_import = "from vllm.v1.core.sched.scheduler_timing import profile_scheduler_function\n"
+    if timing_import not in text:
+        import_anchor = "from vllm.v1.core.sched.scheduler import"
+        first_scheduler_import = text.find(import_anchor)
+        if first_scheduler_import == -1:
+            import_anchor = "from vllm.v1.core.sched."
+            first_scheduler_import = text.find(import_anchor)
+        if first_scheduler_import == -1:
+            raise RuntimeError(f"Could not locate scheduler imports in {scheduler_path}")
+        text = text[:first_scheduler_import] + timing_import + text[first_scheduler_import:]
+
     timing_marker = "        self._policy_last_schedule_time: float | None = None"
     if timing_marker not in text:
         schedule_anchor = "    def schedule(self) -> SchedulerOutput:\n"
@@ -142,6 +154,17 @@ def _configure_scheduler(vllm_source: Path) -> None:
         if schedule_anchor not in text:
             raise RuntimeError(f"Could not locate schedule method in {scheduler_path}")
         text = text.replace(schedule_anchor, timing_fields, 1)
+
+    schedule_anchor = "    def schedule(self) -> SchedulerOutput:\n"
+    schedule_decorator = "    @profile_scheduler_function\n"
+    if schedule_decorator + schedule_anchor not in text:
+        if schedule_anchor not in text:
+            raise RuntimeError(f"Could not locate schedule method in {scheduler_path}")
+        text = text.replace(
+            schedule_anchor,
+            schedule_decorator + schedule_anchor,
+            1,
+        )
 
     loop_anchor = "            while self.waiting and token_budget > 0:\n"
     gate_marker = "self.waiting.should_add_more_to_batch("
@@ -213,6 +236,7 @@ def _install(venv_dir: Path, python: str) -> Path:
     copied_files = {
         "chunked_hash_tree/python.py": "chunked_hash_tree_python.py",
         "chunked_hash_tree/contextual_bandit.py": "contextual_bandit.py",
+        "instrumentation/timing.py": "scheduler_timing.py",
         "policy_request_queues.py": "policy_request_queues.py",
         "radix_cost/python.py": "radix_cost.py",
     }
@@ -271,7 +295,24 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--venv-dir", type=Path, default=cache_root / "policy_venv")
     parser.add_argument("--python", default="3.12")
+    parser.add_argument("--wait-for-tmux-session")
     args = parser.parse_args(argv)
+
+    if args.wait_for_tmux_session:
+        while (
+            subprocess.run(
+                ["tmux", "has-session", "-t", args.wait_for_tmux_session],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode
+            == 0
+        ):
+            print(
+                f"Waiting for tmux session {args.wait_for_tmux_session} to finish",
+                flush=True,
+            )
+            time.sleep(60)
 
     executable = _install(args.venv_dir.expanduser().resolve(), args.python)
     _verify(executable)

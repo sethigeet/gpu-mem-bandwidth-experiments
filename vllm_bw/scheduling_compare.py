@@ -167,6 +167,79 @@ def _write_csv(rows: list[dict[str, object]], path: Path) -> None:
         writer.writerows(rows)
 
 
+_TIMING_PATTERN = re.compile(
+    r"\[VLLM_BW_TIMING\] "
+    r"name=(?P<name>\S+) "
+    r"calls=(?P<calls>\d+) "
+    r"total_ns=(?P<total_ns>\d+) "
+    r"avg_ns=(?P<avg_ns>[\d.]+) "
+    r"min_ns=(?P<min_ns>\d+) "
+    r"max_ns=(?P<max_ns>\d+)"
+)
+
+
+def _aggregate_scheduler_timings(
+    results: list[TrialResult],
+    output_dir: Path,
+) -> None:
+    timing_rows: list[dict[str, object]] = []
+    for result in results:
+        log_path = Path(result.trial_dir) / "server.log"
+        latest_by_name: dict[str, re.Match[str]] = {}
+        for match in _TIMING_PATTERN.finditer(log_path.read_text()):
+            name = match.group("name")
+            previous = latest_by_name.get(name)
+            if previous is None or int(match.group("calls")) > int(previous.group("calls")):
+                latest_by_name[name] = match
+        for name, match in latest_by_name.items():
+            timing_rows.append(
+                {
+                    "trial_id": result.trial_id,
+                    "scheduling_policy": result.scheduling_policy,
+                    "scheduling_mode": result.scheduling_mode,
+                    "function": name,
+                    "calls": int(match.group("calls")),
+                    "total_ms": int(match.group("total_ns")) / 1e6,
+                    "avg_us": float(match.group("avg_ns")) / 1e3,
+                    "min_us": int(match.group("min_ns")) / 1e3,
+                    "max_us": int(match.group("max_ns")) / 1e3,
+                }
+            )
+    if not timing_rows:
+        return
+
+    _write_csv(timing_rows, output_dir / "scheduler_timings.csv")
+    summary_rows: list[dict[str, object]] = []
+    keys = dict.fromkeys(
+        (
+            str(row["scheduling_policy"]),
+            str(row["scheduling_mode"]),
+            str(row["function"]),
+        )
+        for row in timing_rows
+    )
+    for policy, mode, function in keys:
+        matching = [
+            row
+            for row in timing_rows
+            if row["scheduling_policy"] == policy and row["scheduling_mode"] == mode and row["function"] == function
+        ]
+        summary_rows.append(
+            {
+                "scheduling_policy": policy,
+                "scheduling_mode": mode,
+                "function": function,
+                "n": len(matching),
+                "calls_mean": _mean([_as_float(row["calls"]) for row in matching]),
+                "total_ms_mean": _mean([_as_float(row["total_ms"]) for row in matching]),
+                "avg_us_mean": _mean([_as_float(row["avg_us"]) for row in matching]),
+                "avg_us_stdev": _stdev([_as_float(row["avg_us"]) for row in matching]),
+                "max_us_mean": _mean([_as_float(row["max_us"]) for row in matching]),
+            }
+        )
+    _write_csv(summary_rows, output_dir / "scheduler_timing_summary.csv")
+
+
 def _run_trial(
     args: argparse.Namespace,
     model: str,
@@ -322,6 +395,8 @@ def _mean(values: list[float]) -> float:
 
 
 def _stdev(values: list[float]) -> float:
+    if any(not math.isfinite(value) for value in values):
+        return math.nan
     return statistics.stdev(values) if len(values) > 1 else 0.0
 
 
@@ -522,6 +597,10 @@ def run_scheduling_comparison(args: argparse.Namespace) -> int:
         "scheduling_policies": policies,
         "repetitions": args.repetitions,
         "collect_dram": args.collect_dram,
+        "scheduler_profiling": {
+            "enabled": os.environ.get("VLLM_BW_PROFILE_SCHEDULER") == "1",
+            "interval": os.environ.get("VLLM_BW_PROFILE_INTERVAL", "100"),
+        },
         "workload": {
             "random_prefix_len": args.random_prefix_len,
             "random_input_len": args.random_input_len,
@@ -562,5 +641,6 @@ def run_scheduling_comparison(args: argparse.Namespace) -> int:
                     time.sleep(args.cooldown_s)
 
     _aggregate(results, args.output_dir)
+    _aggregate_scheduler_timings(results, args.output_dir)
     print(f"Wrote scheduling comparison to {args.output_dir}")
     return 0

@@ -256,12 +256,16 @@ the async-minus-sync change in output tokens/second and average DRAM bandwidth u
 of sustained peak, averaged only between the first and last active DRAM sample in the client
 benchmark; server startup and warmup are outside the trace.
 
-The Feather paper's `radix_cost`, `chunked_hash_tree_bandit`, and plain CHT policies require its
-modified vLLM fork. `chunked_hash_tree_python` and `chunked_hash_tree_cpp` expose equivalent
+The Feather paper's `radix_cost`, `chunked_hash_tree_bandit`, and plain CHT policies are vendored
+in `vllm_bw/schedulers/`. `chunked_hash_tree_python` and `chunked_hash_tree_cpp` expose equivalent
 plain-CHT queue behavior with a 500-token chunk size so their scheduler overhead can be compared
-directly. Their benchmarked source is vendored in `vllm_bw/schedulers/`; the policy installer
-copies these versions into the isolated vLLM environment. Install the pinned fork in an isolated
-remote environment:
+directly. The installer patches an official pinned vLLM wheel in an isolated remote environment;
+it does not clone or read the original research repository:
+
+- `vllm_bw/schedulers/radix_cost/`: token-level radix policy
+- `vllm_bw/schedulers/chunked_hash_tree/`: Python CHT and contextual bandit
+- `vllm_bw/schedulers/*.cpp`: native CHT implementations
+- `vllm_bw/schedulers/policy_request_queues.py`: vLLM adapter
 
 ```bash
 scripts/vllm_bw.sh install-policies --remote --detach \
@@ -288,6 +292,10 @@ scripts/vllm_bw.sh compare --remote --detach \
 The wrapper automatically selects the isolated policy-enabled vLLM when a custom policy is
 requested. Set `VLLM_POLICY_VENV` to override its default location,
 `~/.cache/vllm_bw/policy_venv`.
+
+Set `VLLM_BW_PROFILE_SCHEDULER=1` to time `Scheduler.schedule()` and the custom queue
+operations. `scheduler_timings.csv` and `scheduler_timing_summary.csv` contain the trial-level
+and aggregated timings; `VLLM_BW_PROFILE_INTERVAL` controls the cumulative log interval.
 
 Interpretation: if DRAM p95 is close to sustained peak while SM activity is materially lower,
 decode is behaving as memory-bound and remaining gains likely need better memory locality,
