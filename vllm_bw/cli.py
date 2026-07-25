@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     scheduling_compare = subparsers.add_parser(
         "scheduling-compare",
-        help="Compare explicit async and sync scheduling with paired NSYS trials",
+        help="Compare request policies across paired async and sync NSYS trials",
     )
     add_scheduling_compare_args(scheduling_compare)
 

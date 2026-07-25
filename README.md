@@ -251,10 +251,43 @@ scripts/vllm_bw.sh compare --remote --detach \
 
 Fetch the printed output directory with `scripts/vllm_bw.sh fetch ...`. Its `impact.csv` reports
 the async-minus-sync change in output tokens/second and average DRAM bandwidth utilization.
-`trials.csv`, `summary.csv`, `paired_comparison.csv`, and `comparison.png` expose trial-level
-values and variance. DRAM utilization is the NSYS percentage of sustained peak, averaged only
-between the first and last active DRAM sample in the client benchmark; server startup and warmup
-are outside the trace.
+`trials.csv`, `summary.csv`, `paired_comparison.csv`, `policy_comparison.csv`, and
+`comparison.png` expose trial-level values and variance. DRAM utilization is the NSYS percentage
+of sustained peak, averaged only between the first and last active DRAM sample in the client
+benchmark; server startup and warmup are outside the trace.
+
+The Feather paper's `radix_cost`, `chunked_hash_tree_bandit`, and plain CHT policies require its
+modified vLLM fork. `chunked_hash_tree_python` and `chunked_hash_tree_cpp` expose equivalent
+plain-CHT queue behavior with a 500-token chunk size so their scheduler overhead can be compared
+directly. Their benchmarked source is vendored in `vllm_bw/schedulers/`; the policy installer
+copies these versions into the isolated vLLM environment. Install the pinned fork in an isolated
+remote environment:
+
+```bash
+scripts/vllm_bw.sh install-policies --remote --detach \
+  --host hinton-01 --remote-dir ~/code/attention-bw
+```
+
+Then compare several request policies while retaining paired async/sync trials:
+
+```bash
+scripts/vllm_bw.sh compare --remote --detach \
+  --host hinton-01 --remote-dir ~/code/attention-bw -- \
+  --scheduling-policies fcfs radix_cost chunked_hash_tree_bandit \
+  --model llama-3.1-8b \
+  --max-model-len 10240 \
+  --random-prefix-len 10000 \
+  --random-input-len 20 \
+  --random-output-len 50 \
+  --num-prompts 1000 \
+  --max-num-seqs 100 \
+  --max-concurrency 100 \
+  --repetitions 3
+```
+
+The wrapper automatically selects the isolated policy-enabled vLLM when a custom policy is
+requested. Set `VLLM_POLICY_VENV` to override its default location,
+`~/.cache/vllm_bw/policy_venv`.
 
 Interpretation: if DRAM p95 is close to sustained peak while SM activity is materially lower,
 decode is behaving as memory-bound and remaining gains likely need better memory locality,

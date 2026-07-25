@@ -25,8 +25,9 @@ from vllm_bw.models import resolve_model
 _MEASURED_RANGE = "vllm_bw:serve:bench"
 
 
-def _vllm_executable() -> str:
-    return shutil.which("vllm") or "vllm"
+def _vllm_executable(args: argparse.Namespace | None = None) -> str:
+    configured = getattr(args, "vllm_executable", None)
+    return configured or os.environ.get("VLLM_EXECUTABLE") or shutil.which("vllm") or "vllm"
 
 
 @contextlib.contextmanager
@@ -91,7 +92,7 @@ def _wait_for_health(url: str, proc: subprocess.Popen, timeout_s: float) -> None
 
 def _server_command(args: argparse.Namespace, model: str) -> list[str]:
     cmd = [
-        _vllm_executable(),
+        _vllm_executable(args),
         "serve",
         model,
         "--host",
@@ -111,6 +112,11 @@ def _server_command(args: argparse.Namespace, model: str) -> list[str]:
     ]
     if args.trust_remote_code:
         cmd.append("--trust-remote-code")
+    if args.enable_prefix_caching:
+        cmd.append("--enable-prefix-caching")
+    scheduling_policy = getattr(args, "scheduling_policy", None)
+    if scheduling_policy:
+        cmd.extend(["--scheduling-policy", scheduling_policy])
     scheduling_mode = getattr(args, "scheduling_mode", None)
     if scheduling_mode == "async":
         cmd.append("--async-scheduling")
@@ -128,7 +134,7 @@ def _bench_command(
     metadata: dict[str, object] | None = None,
 ) -> list[str]:
     cmd = [
-        _vllm_executable(),
+        _vllm_executable(args),
         "bench",
         "serve",
         "--backend",
@@ -215,6 +221,7 @@ def run_serve_profile(args: argparse.Namespace) -> int:
                 "num_prompts": args.num_prompts,
                 "request_rate": args.request_rate,
                 "max_concurrency": args.max_concurrency,
+                "scheduling_policy": args.scheduling_policy,
                 "scheduling_mode": args.scheduling_mode,
                 "nvtx_range": _MEASURED_RANGE,
             },
@@ -247,7 +254,10 @@ def run_serve_profile(args: argparse.Namespace) -> int:
             model,
             args.num_prompts,
             result_path=args.log_dir / "bench_result.json",
-            metadata={"scheduling_mode": args.scheduling_mode or "default"},
+            metadata={
+                "scheduling_policy": args.scheduling_policy,
+                "scheduling_mode": args.scheduling_mode or "default",
+            },
         )
         with _nvtx_range(_MEASURED_RANGE):
             _run_and_log(bench_cmd, args.log_dir / "bench.log", args.bench_timeout_s)
@@ -298,7 +308,10 @@ def run_client_nsys_profile(args: argparse.Namespace) -> int:
             model,
             args.num_prompts,
             result_path=args.log_dir / "bench_result.json",
-            metadata={"scheduling_mode": args.scheduling_mode or "default"},
+            metadata={
+                "scheduling_policy": args.scheduling_policy,
+                "scheduling_mode": args.scheduling_mode or "default",
+            },
         )
         nsys_cmd = [
             "nsys",
@@ -338,6 +351,10 @@ def run_client_nsys_profile(args: argparse.Namespace) -> int:
 
 
 def add_serve_profile_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--vllm-executable",
+        help="vLLM executable to use (defaults to VLLM_EXECUTABLE or PATH)",
+    )
     parser.add_argument("--model", default="phi-3-mini", help="Registry key or raw HF model id")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -351,6 +368,12 @@ def add_serve_profile_args(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Allow vLLM to load model repositories with custom code",
+    )
+    parser.add_argument(
+        "--enable-prefix-caching",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable vLLM automatic prefix caching",
     )
     parser.add_argument("--bench-backend", default="openai", help="Backend passed to `vllm bench serve`")
     parser.add_argument("--endpoint", default="/v1/completions")
@@ -366,6 +389,11 @@ def add_serve_profile_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--warmup-prompts", type=int, default=16)
     parser.add_argument("--request-rate", default="inf")
     parser.add_argument("--max-concurrency", type=int)
+    parser.add_argument(
+        "--scheduling-policy",
+        default="fcfs",
+        help="Request ordering/batching policy passed to vLLM",
+    )
     parser.add_argument(
         "--scheduling-mode",
         choices=["async", "sync"],

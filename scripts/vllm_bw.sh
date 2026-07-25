@@ -5,9 +5,9 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_remote_lib.sh"
 
 COMMAND=${1:-}
 case "$COMMAND" in
-  profile|compare|fetch|install) ;;
+  profile|compare|fetch|install|install-policies) ;;
   *)
-    echo "Usage: $0 {profile|compare|fetch|install} [serve|client] [--remote] [--detach] [--host HOST] [--remote-dir DIR] [--out PREFIX] -- [vLLM args]" >&2
+    echo "Usage: $0 {profile|compare|fetch|install|install-policies} [serve|client] [--remote] [--detach] [--host HOST] [--remote-dir DIR] [--out PREFIX] -- [vLLM args]" >&2
     exit 2
     ;;
 esac
@@ -25,6 +25,30 @@ fi
 parse_common_args "$@"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+if [[ "$COMMAND" == "install-policies" ]]; then
+  [[ "$COMMON_REMOTE" == true ]] || {
+    echo "The policy-enabled vLLM fork is GPU-host-only; use install-policies --remote" >&2
+    exit 2
+  }
+  sync_project "$COMMON_HOST" "$COMMON_REMOTE_DIR"
+  REMOTE_DIR_ABS=$(resolve_remote_dir "$COMMON_HOST" "$COMMON_REMOTE_DIR")
+  INSTALL_ARGS=(
+    python3 -m vllm_bw.policy_fork
+    "${COMMON_EXTRA[@]}"
+  )
+  if [[ "$COMMON_DETACH" == true ]]; then
+    SESSION=${TMUX_SESSION:-vllm_bw_install_policies_${TIMESTAMP}}
+    LOG="results/vllm_policy_install_${TIMESTAMP}.remote.log"
+    start_remote_tmux \
+      "$COMMON_HOST" "$REMOTE_DIR_ABS" "$SESSION" "$LOG" "${INSTALL_ARGS[@]}"
+    echo "Started remote policy installation in tmux session: $SESSION"
+    echo "Remote installation log: $LOG"
+  else
+    run_remote "$COMMON_HOST" "$REMOTE_DIR_ABS" "${INSTALL_ARGS[@]}"
+  fi
+  exit 0
+fi
+
 if [[ "$COMMAND" == "compare" ]]; then
   OUT=${COMMON_OUT:-results/vllm_scheduling_compare_${TIMESTAMP}}
 elif [[ "$COMMAND" == "profile" ]]; then
@@ -70,10 +94,22 @@ fi
 if [[ "$COMMON_REMOTE" == true ]]; then
   sync_project "$COMMON_HOST" "$COMMON_REMOTE_DIR"
   REMOTE_DIR_ABS=$(resolve_remote_dir "$COMMON_HOST" "$COMMON_REMOTE_DIR")
+  REMOTE_ENV=(env)
+  for variable in VLLM_ATTENTION_BACKEND HF_HUB_OFFLINE HF_HOME WAIT_FOR_TMUX_SESSION; do
+    if [[ -v "$variable" ]]; then
+      REMOTE_ENV+=("$variable=${!variable}")
+    fi
+  done
   if [[ "$COMMAND" == "compare" ]]; then
-    REMOTE_ARGS=(./scripts/vllm_bw.sh compare --out "$OUT" -- "${COMMON_EXTRA[@]}")
+    REMOTE_ARGS=(
+      "${REMOTE_ENV[@]}"
+      ./scripts/vllm_bw.sh compare --out "$OUT" -- "${COMMON_EXTRA[@]}"
+    )
   else
-    REMOTE_ARGS=(./scripts/vllm_bw.sh profile "$PROFILE_SCOPE" --out "$OUT" -- "${COMMON_EXTRA[@]}")
+    REMOTE_ARGS=(
+      "${REMOTE_ENV[@]}"
+      ./scripts/vllm_bw.sh profile "$PROFILE_SCOPE" --out "$OUT" -- "${COMMON_EXTRA[@]}"
+    )
   fi
   if [[ "$COMMON_DETACH" == true ]]; then
     SESSION=${TMUX_SESSION:-vllm_bw_${COMMAND}_${TIMESTAMP}}
@@ -93,6 +129,26 @@ export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
 export VLLM_USE_FLASHINFER_SAMPLER=${VLLM_USE_FLASHINFER_SAMPLER:-0}
 
 if [[ "$COMMAND" == "compare" ]]; then
+  HAS_CUSTOM_POLICY=false
+  HAS_VLLM_EXECUTABLE=false
+  for arg in "${COMMON_EXTRA[@]}"; do
+    case "$arg" in
+      radix_cost|chunked_hash_tree_bandit|chunked_hash_tree_python|chunked_hash_tree_cpp)
+        HAS_CUSTOM_POLICY=true
+        ;;
+      --vllm-executable) HAS_VLLM_EXECUTABLE=true ;;
+    esac
+  done
+  if [[ "$HAS_CUSTOM_POLICY" == true && "$HAS_VLLM_EXECUTABLE" == false ]]; then
+    POLICY_VENV=${VLLM_POLICY_VENV:-$HOME/.cache/vllm_bw/policy_venv}
+    COMMON_EXTRA+=(--vllm-executable "$POLICY_VENV/bin/vllm")
+  fi
+  if [[ -n ${WAIT_FOR_TMUX_SESSION:-} ]]; then
+    while tmux has-session -t "$WAIT_FOR_TMUX_SESSION" 2>/dev/null; do
+      echo "Waiting for tmux session $WAIT_FOR_TMUX_SESSION to finish"
+      sleep "${GPU_WAIT_INTERVAL_S:-60}"
+    done
+  fi
   while [[ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits)" ]]; do
     echo "GPU busy; waiting ${GPU_WAIT_INTERVAL_S:-60} seconds before vLLM comparison"
     nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv

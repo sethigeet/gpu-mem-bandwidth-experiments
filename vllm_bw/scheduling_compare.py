@@ -6,6 +6,7 @@ import csv
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
 import time
@@ -32,6 +33,7 @@ from vllm_bw.visualize import extract_dram_utilization, visualize_nsys
 @dataclass(frozen=True)
 class TrialResult:
     trial_id: int
+    scheduling_policy: str
     scheduling_mode: str
     order_in_pair: int
     seed: int
@@ -61,6 +63,20 @@ def add_scheduling_compare_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--nsys-gpu-metrics-devices", default="all")
     parser.add_argument("--nsys-gpu-metrics-frequency", type=int, default=10000)
     parser.add_argument(
+        "--collect-dram",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Collect NSYS DRAM metrics; disable for throughput-only comparisons",
+    )
+    parser.add_argument(
+        "--scheduling-policies",
+        nargs="+",
+        help=(
+            "Request policies to compare. Defaults to the singular "
+            "--scheduling-policy value; use space-separated policy names."
+        ),
+    )
+    parser.add_argument(
         "--fail-on-scheduler-warning",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -68,15 +84,16 @@ def add_scheduling_compare_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _probe_environment() -> dict[str, str]:
-    executable = _vllm_executable()
+def _probe_environment(args: argparse.Namespace, policies: list[str]) -> dict[str, str]:
+    executable = _vllm_executable(args)
     version_result = subprocess.run(
         [executable, "--version"],
         check=True,
         capture_output=True,
         text=True,
     )
-    version = version_result.stdout.strip() or version_result.stderr.strip()
+    version_output = version_result.stdout.strip() or version_result.stderr.strip()
+    version = version_output.splitlines()[-1]
     help_text = subprocess.run(
         [executable, "serve", "--help"],
         check=True,
@@ -94,6 +111,14 @@ def _probe_environment() -> dict[str, str]:
         raise RuntimeError(
             "Installed vLLM does not expose both --async-scheduling and "
             "--no-async-scheduling; upgrade vLLM before running this comparison"
+        )
+    if "--scheduling-policy" not in help_text:
+        raise RuntimeError("Installed vLLM does not expose --scheduling-policy")
+    unavailable = [policy for policy in policies if policy not in help_text]
+    if unavailable:
+        raise RuntimeError(
+            "Installed vLLM does not advertise the requested scheduling policies: "
+            f"{', '.join(unavailable)}. Install the policy-enabled vLLM fork first."
         )
 
     gpu = subprocess.run(
@@ -120,6 +145,17 @@ def _scheduler_warning(log_text: str) -> str | None:
     return None
 
 
+def _nsys_profile_failure(log_text: str) -> str | None:
+    failure_markers = (
+        "TargetProfilingFailed",
+        "GPU Metrics event chronological order was broken",
+    )
+    for line in log_text.splitlines():
+        if any(marker in line for marker in failure_markers):
+            return line.strip()
+    return None
+
+
 def _write_csv(rows: list[dict[str, object]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -136,13 +172,15 @@ def _run_trial(
     model: str,
     environment: dict[str, str],
     trial_id: int,
+    policy: str,
     mode: str,
     order_in_pair: int,
 ) -> TrialResult:
     trial_args = copy.copy(args)
+    trial_args.scheduling_policy = policy
     trial_args.scheduling_mode = mode
     trial_args.seed = args.seed + trial_id
-    trial_dir = args.output_dir / "trials" / f"trial_{trial_id:03d}_{mode}"
+    trial_dir = args.output_dir / "trials" / f"trial_{trial_id:03d}_{policy}_{mode}"
     trial_dir.mkdir(parents=True, exist_ok=True)
     trial_args.log_dir = trial_dir
 
@@ -157,6 +195,7 @@ def _run_trial(
         trial_args.num_prompts,
         result_path=result_path,
         metadata={
+            "scheduling_policy": policy,
             "scheduling_mode": mode,
             "trial_id": trial_id,
             "seed": trial_args.seed,
@@ -164,6 +203,7 @@ def _run_trial(
     )
     config = {
         "trial_id": trial_id,
+        "scheduling_policy": policy,
         "scheduling_mode": mode,
         "order_in_pair": order_in_pair,
         "seed": trial_args.seed,
@@ -196,23 +236,29 @@ def _run_trial(
                 trial_args.bench_timeout_s,
             )
 
-        nsys_cmd = [
-            "nsys",
-            "profile",
-            "--trace",
-            trial_args.nsys_trace,
-            "--gpu-metrics-devices",
-            trial_args.nsys_gpu_metrics_devices,
-            "--gpu-metrics-frequency",
-            str(trial_args.nsys_gpu_metrics_frequency),
-            "--duration",
-            "0",
-            "--output",
-            str(profile_prefix),
-            "--force-overwrite=true",
-            *bench_cmd,
-        ]
-        _run_and_log(nsys_cmd, bench_log_path, trial_args.bench_timeout_s)
+        if trial_args.collect_dram:
+            nsys_cmd = [
+                "nsys",
+                "profile",
+                "--trace",
+                trial_args.nsys_trace,
+                "--gpu-metrics-devices",
+                trial_args.nsys_gpu_metrics_devices,
+                "--gpu-metrics-frequency",
+                str(trial_args.nsys_gpu_metrics_frequency),
+                "--duration",
+                "0",
+                "--output",
+                str(profile_prefix),
+                "--force-overwrite=true",
+                *bench_cmd,
+            ]
+            nsys_output = _run_and_log(nsys_cmd, bench_log_path, trial_args.bench_timeout_s)
+            profile_failure = _nsys_profile_failure(nsys_output)
+            if profile_failure:
+                raise RuntimeError(f"NSYS GPU metric collection failed: {profile_failure}")
+        else:
+            _run_and_log(bench_cmd, bench_log_path, trial_args.bench_timeout_s)
     finally:
         _terminate_process_group(server)
         server_log.close()
@@ -221,39 +267,47 @@ def _run_trial(
     if mode == "async" and warning and args.fail_on_scheduler_warning:
         raise RuntimeError(f"vLLM did not honor async scheduling: {warning}")
 
-    subprocess.run(
-        [
-            "nsys",
-            "export",
-            "--type=sqlite",
-            f"--output={sqlite_path}",
-            f"{profile_prefix}.nsys-rep",
-        ],
-        check=True,
-    )
     metrics = parse_bench_artifacts(result_path, bench_log_path)
     if metrics.failed_requests:
-        raise RuntimeError(f"Trial {trial_id} ({mode}) had {metrics.failed_requests} failed requests")
-    dram = extract_dram_utilization(
-        sqlite_path,
-        measured_only=False,
-        trim_idle_edges=True,
-    )
-    visualize_nsys(
-        sqlite_path,
-        trial_dir / "profile.png",
-        summary_output=trial_dir / "profile_summary.csv",
-        measured_only=False,
-    )
+        raise RuntimeError(f"Trial {trial_id} ({policy}, {mode}) had {metrics.failed_requests} failed requests")
+    dram_avg_pct = math.nan
+    dram_p95_pct = math.nan
+    dram_samples = 0
+    if trial_args.collect_dram:
+        subprocess.run(
+            [
+                "nsys",
+                "export",
+                "--type=sqlite",
+                f"--output={sqlite_path}",
+                f"{profile_prefix}.nsys-rep",
+            ],
+            check=True,
+        )
+        dram = extract_dram_utilization(
+            sqlite_path,
+            measured_only=False,
+            trim_idle_edges=True,
+        )
+        visualize_nsys(
+            sqlite_path,
+            trial_dir / "profile.png",
+            summary_output=trial_dir / "profile_summary.csv",
+            measured_only=False,
+        )
+        dram_avg_pct = dram.avg_pct
+        dram_p95_pct = dram.p95_pct
+        dram_samples = dram.samples
     return TrialResult(
         trial_id=trial_id,
+        scheduling_policy=policy,
         scheduling_mode=mode,
         order_in_pair=order_in_pair,
         seed=trial_args.seed,
         output_throughput_toks_s=metrics.output_throughput_toks_s,
-        dram_avg_pct=dram.avg_pct,
-        dram_p95_pct=dram.p95_pct,
-        dram_samples=dram.samples,
+        dram_avg_pct=dram_avg_pct,
+        dram_p95_pct=dram_p95_pct,
+        dram_samples=dram_samples,
         benchmark_duration_s=metrics.benchmark_duration_s,
         total_output_tokens=metrics.total_output_tokens,
         completed_requests=metrics.completed_requests,
@@ -277,98 +331,162 @@ def _as_float(value: object) -> float:
     raise TypeError(f"Expected a numeric value, got {value!r}")
 
 
+def _change_pct(new: float, baseline: float) -> float:
+    return 100 * (new - baseline) / baseline
+
+
 def _aggregate(results: list[TrialResult], output_dir: Path) -> None:
-    by_mode = {mode: [result for result in results if result.scheduling_mode == mode] for mode in ("sync", "async")}
+    policies = list(dict.fromkeys(result.scheduling_policy for result in results))
+    by_policy_mode = {
+        (policy, mode): [
+            result for result in results if result.scheduling_policy == policy and result.scheduling_mode == mode
+        ]
+        for policy in policies
+        for mode in ("sync", "async")
+    }
     summary_rows: list[dict[str, object]] = []
-    for mode, mode_results in by_mode.items():
-        throughputs = [result.output_throughput_toks_s for result in mode_results]
-        dram = [result.dram_avg_pct for result in mode_results]
-        summary_rows.append(
-            {
-                "scheduling_mode": mode,
-                "n": len(mode_results),
-                "throughput_mean_toks_s": _mean(throughputs),
-                "throughput_stdev_toks_s": _stdev(throughputs),
-                "dram_avg_mean_pct": _mean(dram),
-                "dram_avg_stdev_pct": _stdev(dram),
-            }
-        )
+    for policy in policies:
+        for mode in ("sync", "async"):
+            mode_results = by_policy_mode[(policy, mode)]
+            throughputs = [result.output_throughput_toks_s for result in mode_results]
+            dram = [result.dram_avg_pct for result in mode_results]
+            summary_rows.append(
+                {
+                    "scheduling_policy": policy,
+                    "scheduling_mode": mode,
+                    "n": len(mode_results),
+                    "throughput_mean_toks_s": _mean(throughputs),
+                    "throughput_stdev_toks_s": _stdev(throughputs),
+                    "dram_avg_mean_pct": _mean(dram),
+                    "dram_avg_stdev_pct": _stdev(dram),
+                }
+            )
     _write_csv(summary_rows, output_dir / "summary.csv")
 
     pairs: list[dict[str, object]] = []
-    for trial_id in sorted({result.trial_id for result in results}):
-        pair = {result.scheduling_mode: result for result in results if result.trial_id == trial_id}
-        if set(pair) != {"async", "sync"}:
-            continue
-        async_result = pair["async"]
-        sync_result = pair["sync"]
-        pairs.append(
-            {
-                "trial_id": trial_id,
-                "async_throughput_toks_s": async_result.output_throughput_toks_s,
-                "sync_throughput_toks_s": sync_result.output_throughput_toks_s,
-                "throughput_delta_toks_s": (
-                    async_result.output_throughput_toks_s - sync_result.output_throughput_toks_s
-                ),
-                "throughput_change_pct": 100
-                * (async_result.output_throughput_toks_s - sync_result.output_throughput_toks_s)
-                / sync_result.output_throughput_toks_s,
-                "async_dram_avg_pct": async_result.dram_avg_pct,
-                "sync_dram_avg_pct": sync_result.dram_avg_pct,
-                "dram_delta_pct_points": async_result.dram_avg_pct - sync_result.dram_avg_pct,
-                "dram_change_pct": 100
-                * (async_result.dram_avg_pct - sync_result.dram_avg_pct)
-                / sync_result.dram_avg_pct,
+    for policy in policies:
+        for trial_id in sorted({result.trial_id for result in results}):
+            pair = {
+                result.scheduling_mode: result
+                for result in results
+                if result.scheduling_policy == policy and result.trial_id == trial_id
             }
-        )
+            if set(pair) != {"async", "sync"}:
+                continue
+            async_result = pair["async"]
+            sync_result = pair["sync"]
+            pairs.append(
+                {
+                    "scheduling_policy": policy,
+                    "trial_id": trial_id,
+                    "async_throughput_toks_s": async_result.output_throughput_toks_s,
+                    "sync_throughput_toks_s": sync_result.output_throughput_toks_s,
+                    "throughput_delta_toks_s": (
+                        async_result.output_throughput_toks_s - sync_result.output_throughput_toks_s
+                    ),
+                    "throughput_change_pct": _change_pct(
+                        async_result.output_throughput_toks_s,
+                        sync_result.output_throughput_toks_s,
+                    ),
+                    "async_dram_avg_pct": async_result.dram_avg_pct,
+                    "sync_dram_avg_pct": sync_result.dram_avg_pct,
+                    "dram_delta_pct_points": (async_result.dram_avg_pct - sync_result.dram_avg_pct),
+                    "dram_change_pct": _change_pct(
+                        async_result.dram_avg_pct,
+                        sync_result.dram_avg_pct,
+                    ),
+                }
+            )
     _write_csv(pairs, output_dir / "paired_comparison.csv")
 
     impact_rows: list[dict[str, object]] = []
-    for metric, field in (
-        ("output_throughput_toks_s", "output_throughput_toks_s"),
-        ("dram_avg_pct", "dram_avg_pct"),
-    ):
-        sync_values = [float(getattr(result, field)) for result in by_mode["sync"]]
-        async_values = [float(getattr(result, field)) for result in by_mode["async"]]
-        sync_mean = _mean(sync_values)
-        async_mean = _mean(async_values)
-        impact_rows.append(
+    policy_comparison_rows: list[dict[str, object]] = []
+    for policy in policies:
+        policy_metrics: dict[str, tuple[float, float, float, float]] = {}
+        for metric, field in (
+            ("output_throughput_toks_s", "output_throughput_toks_s"),
+            ("dram_avg_pct", "dram_avg_pct"),
+        ):
+            sync_values = [float(getattr(result, field)) for result in by_policy_mode[(policy, "sync")]]
+            async_values = [float(getattr(result, field)) for result in by_policy_mode[(policy, "async")]]
+            sync_mean = _mean(sync_values)
+            async_mean = _mean(async_values)
+            policy_metrics[metric] = (
+                sync_mean,
+                _stdev(sync_values),
+                async_mean,
+                _stdev(async_values),
+            )
+            impact_rows.append(
+                {
+                    "scheduling_policy": policy,
+                    "metric": metric,
+                    "sync_mean": sync_mean,
+                    "sync_stdev": _stdev(sync_values),
+                    "async_mean": async_mean,
+                    "async_stdev": _stdev(async_values),
+                    "async_minus_sync": async_mean - sync_mean,
+                    "change_pct": _change_pct(async_mean, sync_mean),
+                }
+            )
+        throughput = policy_metrics["output_throughput_toks_s"]
+        dram = policy_metrics["dram_avg_pct"]
+        policy_comparison_rows.append(
             {
-                "metric": metric,
-                "sync_mean": sync_mean,
-                "sync_stdev": _stdev(sync_values),
-                "async_mean": async_mean,
-                "async_stdev": _stdev(async_values),
-                "async_minus_sync": async_mean - sync_mean,
-                "change_pct": 100 * (async_mean - sync_mean) / sync_mean,
+                "scheduling_policy": policy,
+                "n_pairs": len(by_policy_mode[(policy, "sync")]),
+                "sync_throughput_mean_toks_s": throughput[0],
+                "sync_throughput_stdev_toks_s": throughput[1],
+                "async_throughput_mean_toks_s": throughput[2],
+                "async_throughput_stdev_toks_s": throughput[3],
+                "throughput_delta_toks_s": throughput[2] - throughput[0],
+                "throughput_change_pct": _change_pct(throughput[2], throughput[0]),
+                "sync_dram_mean_pct": dram[0],
+                "sync_dram_stdev_pct": dram[1],
+                "async_dram_mean_pct": dram[2],
+                "async_dram_stdev_pct": dram[3],
+                "dram_delta_pct_points": dram[2] - dram[0],
+                "dram_change_pct": _change_pct(dram[2], dram[0]),
             }
         )
     _write_csv(impact_rows, output_dir / "impact.csv")
+    _write_csv(policy_comparison_rows, output_dir / "policy_comparison.csv")
     _plot_comparison(summary_rows, output_dir / "comparison.png")
 
 
 def _plot_comparison(summary_rows: list[dict[str, object]], output: Path) -> None:
-    rows = {str(row["scheduling_mode"]): row for row in summary_rows}
+    rows = {(str(row["scheduling_policy"]), str(row["scheduling_mode"])): row for row in summary_rows}
+    policies = list(dict.fromkeys(str(row["scheduling_policy"]) for row in summary_rows))
     modes = ["sync", "async"]
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
-    axes[0].bar(
-        modes,
-        [_as_float(rows[mode]["throughput_mean_toks_s"]) for mode in modes],
-        yerr=[_as_float(rows[mode]["throughput_stdev_toks_s"]) for mode in modes],
-        capsize=5,
-    )
+    positions = list(range(len(policies)))
+    width = 0.36
+    fig, axes = plt.subplots(1, 2, figsize=(max(10, len(policies) * 3), 4.5))
+    for mode_index, mode in enumerate(modes):
+        offsets = [position + (mode_index - 0.5) * width for position in positions]
+        axes[0].bar(
+            offsets,
+            [_as_float(rows[(policy, mode)]["throughput_mean_toks_s"]) for policy in policies],
+            yerr=[_as_float(rows[(policy, mode)]["throughput_stdev_toks_s"]) for policy in policies],
+            width=width,
+            capsize=5,
+            label=mode,
+        )
+        axes[1].bar(
+            offsets,
+            [_as_float(rows[(policy, mode)]["dram_avg_mean_pct"]) for policy in policies],
+            yerr=[_as_float(rows[(policy, mode)]["dram_avg_stdev_pct"]) for policy in policies],
+            width=width,
+            capsize=5,
+            label=mode,
+        )
     axes[0].set_ylabel("Output tokens / second")
     axes[0].set_title("Serving throughput")
-    axes[1].bar(
-        modes,
-        [_as_float(rows[mode]["dram_avg_mean_pct"]) for mode in modes],
-        yerr=[_as_float(rows[mode]["dram_avg_stdev_pct"]) for mode in modes],
-        capsize=5,
-    )
     axes[1].set_ylabel("Percent of sustained peak")
     axes[1].set_title("Average DRAM bandwidth utilization")
     for axis in axes:
+        axis.set_xticks(positions, policies, rotation=15, ha="right")
         axis.grid(True, axis="y", alpha=0.3)
+        axis.legend()
     fig.tight_layout()
     fig.savefig(output, dpi=150)
     plt.close(fig)
@@ -379,7 +497,16 @@ def run_scheduling_comparison(args: argparse.Namespace) -> int:
         raise ValueError("--repetitions must be at least 1")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model = resolve_model(args.model)
-    environment = _probe_environment()
+    policies = list(dict.fromkeys(args.scheduling_policies or [args.scheduling_policy]))
+    if not policies:
+        raise ValueError("At least one scheduling policy is required")
+    invalid_policies = [policy for policy in policies if re.fullmatch(r"[A-Za-z0-9_-]+", policy) is None]
+    if invalid_policies:
+        raise ValueError(
+            "Scheduling policy names may contain only letters, digits, underscores, and hyphens: "
+            f"{', '.join(invalid_policies)}"
+        )
+    environment = _probe_environment(args, policies)
     effective_concurrency = args.max_concurrency or args.max_num_seqs
     planned_request_waves = math.ceil(args.num_prompts / effective_concurrency)
     if planned_request_waves < 2:
@@ -392,7 +519,9 @@ def run_scheduling_comparison(args: argparse.Namespace) -> int:
         "created_at": datetime.now(UTC).isoformat(),
         "environment": environment,
         "model": model,
+        "scheduling_policies": policies,
         "repetitions": args.repetitions,
+        "collect_dram": args.collect_dram,
         "workload": {
             "random_prefix_len": args.random_prefix_len,
             "random_input_len": args.random_input_len,
@@ -410,24 +539,27 @@ def run_scheduling_comparison(args: argparse.Namespace) -> int:
 
     results: list[TrialResult] = []
     for trial_id in range(args.repetitions):
-        order = ("async", "sync") if trial_id % 2 == 0 else ("sync", "async")
-        for order_in_pair, mode in enumerate(order):
-            print(
-                f"Running scheduling trial {trial_id + 1}/{args.repetitions}: {mode}",
-                flush=True,
-            )
-            result = _run_trial(
-                args,
-                model,
-                environment,
-                trial_id,
-                mode,
-                order_in_pair,
-            )
-            results.append(result)
-            _write_csv([asdict(item) for item in results], args.output_dir / "trials.csv")
-            if args.cooldown_s > 0:
-                time.sleep(args.cooldown_s)
+        policy_order = policies if trial_id % 2 == 0 else list(reversed(policies))
+        for policy_index, policy in enumerate(policy_order):
+            mode_order = ("async", "sync") if (trial_id + policy_index) % 2 == 0 else ("sync", "async")
+            for order_in_pair, mode in enumerate(mode_order):
+                print(
+                    f"Running trial {trial_id + 1}/{args.repetitions}: policy={policy}, mode={mode}",
+                    flush=True,
+                )
+                result = _run_trial(
+                    args,
+                    model,
+                    environment,
+                    trial_id,
+                    policy,
+                    mode,
+                    order_in_pair,
+                )
+                results.append(result)
+                _write_csv([asdict(item) for item in results], args.output_dir / "trials.csv")
+                if args.cooldown_s > 0:
+                    time.sleep(args.cooldown_s)
 
     _aggregate(results, args.output_dir)
     print(f"Wrote scheduling comparison to {args.output_dir}")
