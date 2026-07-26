@@ -171,25 +171,54 @@ paired repetitions, and explicit sync/async scheduling. This experiment timed th
 disabled because the host's GPU-metrics profiler remained locked; these results are therefore
 throughput and CPU-function timings only.
 
-At batch 100, Python `find_best_request()` averaged 1.14 microseconds in sync mode and 1.27
-microseconds in async mode. C++ through pybind averaged 1.40 and 2.49 microseconds, respectively.
-Each trial recorded approximately 5,300-5,400 calls, so cumulative `find_best_request()` time was
-only 6-14 milliseconds. At batch 500, Python averaged 1.19-1.22 microseconds and C++ averaged
-1.75-2.59 microseconds across approximately 10,800 calls, for only 13-28 milliseconds total.
-The cached C++ lookup is too short for its implementation advantage to overcome pybind call
-overhead, but both implementations are negligible at end-to-end scale.
+### Unlimited-arrival Response Metrics
+
+| Batch | CHT | Mode | Throughput (tok/s) | Mean TTFT (ms) | Mean TPOT (ms) |
+| ---: | --- | --- | ---: | ---: | ---: |
+| 100 | Python | Sync | 1549.76 | 1325.06 | 37.46 |
+| 100 | Python | Async | 1589.70 | 1344.23 | 35.22 |
+| 100 | C++ | Sync | 1779.51 | 867.24 | 38.15 |
+| 100 | C++ | Async | 1833.37 | 924.10 | 35.31 |
+| 500 | Python | Sync | 2139.23 | 5701.30 | 115.90 |
+| 500 | Python | Async | 2161.63 | 5574.09 | 115.16 |
+| 500 | C++ | Sync | 2682.20 | 2799.07 | 126.51 |
+| 500 | C++ | Async | 2704.00 | 3230.09 | 116.03 |
+
+For the 50-token output, approximate mean request latency is `TTFT + 49 × TPOT`.
+At batch 100 this decreased by 2.87% for Python and 3.00% for C++, corresponding closely
+to the 2.58% and 3.03% throughput improvements. At batch 500, Python TPOT changed by only
+-0.63%. C++ TPOT improved by 8.29%, but its 15.40% TTFT increase offset most of that saving.
+Approximate request latency therefore improved by only 1.43% for Python and 0.92% for C++,
+consistent with the smaller 1.05% and 0.81% throughput increases.
+
+| Batch | Cross-implementation comparison | Throughput difference |
+| ---: | --- | ---: |
+| 100 | Python sync versus C++ sync | -12.91% |
+| 100 | Python async versus C++ sync | -10.67% |
+| 500 | Python sync versus C++ sync | -20.24% |
+| 500 | Python async versus C++ sync | -19.41% |
+
+### Unlimited-arrival Function Timings
+
+All timings below are mean latency per call. `add_request()` is shown in milliseconds and
+`find_best_request()` in microseconds.
+
+| Batch | Function | Python sync | Python async | C++ sync | C++ async |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 100 | `add_request` (ms) | 7.439 | 7.767 | 0.388 | 0.384 |
+| 500 | `add_request` (ms) | 8.275 | 8.316 | 0.392 | 0.435 |
+| 100 | `find_best_request` (µs) | 1.137 | 1.270 | 1.400 | 2.494 |
+| 500 | `find_best_request` (µs) | 1.187 | 1.222 | 1.747 | 2.590 |
+
+Each trial recorded approximately 5,300-5,400 `find_best_request()` calls at batch 100 and
+10,800 calls at batch 500. Its cumulative time was only 6-28 milliseconds. The cached C++ lookup
+is too short for its implementation advantage to overcome pybind call overhead, but both
+implementations are negligible at end-to-end scale.
 
 The expensive difference was request insertion, which hashes every token in the roughly
-10,019-token input. Python `add_request()` averaged 7.44-7.77 milliseconds at batch 100 and
-8.27-8.32 milliseconds at batch 500. C++ averaged 0.38-0.39 milliseconds and 0.39-0.43
-milliseconds, respectively, making insertion roughly 19-21 times faster in C++.
-
-At batch 100, Python throughput was 1549.76 sync and 1589.70 async tokens/second (+2.58%), while
-C++ reached 1779.51 and 1833.37 tokens/second (+3.03%). At batch 500, Python reached 2139.23 and
-2161.63 tokens/second (+1.05%), while C++ reached 2682.20 and 2704.00 tokens/second (+0.81%).
-Async scheduling therefore did not hide the implementation gap: C++ remained about 15% faster
-at batch 100 and 25% faster at batch 500 in both modes. The evidence points to prompt insertion
-and hashing, not request selection, as the primary Python CHT cost.
+10,019-token input. Python insertion was approximately 19-21 times slower than C++. Async
+scheduling therefore did not hide the implementation gap: the evidence points to prompt
+insertion and hashing, not request selection, as the primary Python CHT cost.
 
 Timing artifacts:
 
@@ -197,6 +226,94 @@ Timing artifacts:
 - Batch 500: `results/vllm_cht_find_best_timing_10k_multiwave_b500/`
 - Trial-level timings: `scheduler_timings.csv`
 - Aggregated timings: `scheduler_timing_summary.csv`
+
+## Poisson-arrival Chunked Hash Tree Follow-up
+
+To test whether async scheduling hides request-insertion overhead when requests arrive
+continuously, the plain Python and C++ CHT policies were rerun with finite request rates. vLLM's
+default burstiness of 1 produces exponential inter-arrival times, i.e. a Poisson arrival process.
+These rates were selected below the measured service capacity so that the experiment remained a
+stable open-loop queue rather than eventually becoming another always-backlogged workload.
+
+### Poisson Configuration
+
+| Configured batch | Arrival rate | Offered output rate | Requests | Max concurrency | Repetitions | Seeds |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 100 | 25 requests/s | 1,250 tokens/s | 1,000 | 100 | 3 per policy/mode | 0, 1, 2 |
+| 500 | 35 requests/s | 1,750 tokens/s | 2,500 | 500 | 3 per policy/mode | 0, 1, 2 |
+
+Both configurations used a 10,000-token shared prefix, 20-token unique suffix, 50-token output,
+and burstiness 1.
+
+Because a stable open-loop benchmark is rate-limited, output throughput is expected to be almost
+the same across implementations. TTFT and TPOT are the useful response variables:
+
+### Poisson Response Metrics
+
+| Batch | CHT | Mode | Throughput (tok/s) | Mean TTFT (ms) | Mean TPOT (ms) |
+| ---: | --- | --- | ---: | ---: | ---: |
+| 100, 25 req/s | Python | Sync | 1205.38 | 224.34 | 40.25 |
+| 100, 25 req/s | Python | Async | 1207.92 | 252.86 | 36.85 |
+| 100, 25 req/s | C++ | Sync | 1206.49 | 206.51 | 34.96 |
+| 100, 25 req/s | C++ | Async | 1208.21 | 232.95 | 31.79 |
+| 500, 35 req/s | Python | Sync | 1708.61 | 253.60 | 54.63 |
+| 500, 35 req/s | Python | Async | 1709.19 | 295.46 | 47.45 |
+| 500, 35 req/s | C++ | Sync | 1710.79 | 221.86 | 41.97 |
+| 500, 35 req/s | C++ | Async | 1712.94 | 256.74 | 37.52 |
+
+### Poisson Async-versus-sync Effect
+
+Latency decreases are improvements. Estimated end-to-end latency is
+`TTFT + 49 × TPOT` for the 50-token output.
+
+| Batch | CHT | Throughput change | TTFT change | TPOT change | Estimated end-to-end change |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 100 | Python | +0.21% | +12.72% | -8.44% | -6.28% |
+| 100 | C++ | +0.14% | +12.80% | -9.07% | -6.72% |
+| 500 | Python | +0.03% | +16.51% | -13.15% | -10.58% |
+| 500 | C++ | +0.13% | +15.72% | -10.60% | -8.04% |
+
+All three paired trials agreed on the direction of the TPOT improvement. Async execution
+therefore improved token-generation cadence and end-to-end request latency under continuous
+arrivals, while increasing time to first token. Throughput remained nearly fixed because the
+offered arrival rate, rather than server capacity, was the bottleneck.
+
+### Poisson Python-versus-C++ Comparisons
+
+Positive latency differences mean Python was slower. Throughput differences are relative to C++
+sync.
+
+| Batch | Comparison | Throughput difference | TTFT difference | TPOT difference |
+| ---: | --- | ---: | ---: | ---: |
+| 100 | Python sync versus C++ sync | -0.09% | +8.63% | +15.14% |
+| 100 | Python async versus C++ sync | +0.12% | +22.45% | +5.42% |
+| 500 | Python sync versus C++ sync | -0.13% | +14.30% | +30.16% |
+| 500 | Python async versus C++ sync | -0.09% | +33.17% | +13.05% |
+
+Async Python recovered part of the TPOT gap against sync C++, reducing it from 15.14% to 5.42%
+at batch 100 and from 30.16% to 13.05% at batch 500. It did not close the gap, and its TTFT
+became substantially worse.
+
+### Poisson Function Timings
+
+| Batch | Function | Python sync | Python async | C++ sync | C++ async |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 100 | `add_request` (ms) | 5.176 | 6.645 | 0.227 | 0.292 |
+| 500 | `add_request` (ms) | 5.732 | 6.951 | 0.248 | 0.321 |
+| 100 | `find_best_request` (µs) | 1.368 | 1.574 | 1.295 | 1.543 |
+| 500 | `find_best_request` (µs) | 1.390 | 1.501 | 1.380 | 1.654 |
+
+Python insertion remained approximately 22-23 times slower. Async scheduling overlaps
+scheduling work with GPU execution, which benefits subsequent-token cadence, but a new request
+must still be admitted and hashed before its first token can be scheduled. It cannot hide this
+serial admission path, and the added async pipeline latency makes TTFT worse here.
+
+Poisson-arrival artifacts:
+
+- Batch 100 at 25 requests/second: `results/vllm_cht_poisson_10k_b100_r25/`
+- Batch 500 at 35 requests/second: `results/vllm_cht_poisson_10k_b500_r35/`
+- Aggregate response metrics: `policy_comparison.csv`
+- Aggregate function timings: `scheduler_timing_summary.csv`
 
 ## Multi-wave 10K Scheduler Follow-up
 

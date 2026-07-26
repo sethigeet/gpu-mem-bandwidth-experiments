@@ -47,6 +47,9 @@ class TrialResult:
     failed_requests: int
     vllm_version: str
     trial_dir: str
+    mean_ttft_ms: float = math.nan
+    mean_tpot_ms: float = math.nan
+    mean_itl_ms: float = math.nan
 
 
 def add_scheduling_compare_args(parser: argparse.ArgumentParser) -> None:
@@ -387,6 +390,9 @@ def _run_trial(
         failed_requests=metrics.failed_requests,
         vllm_version=environment["vllm_version"],
         trial_dir=str(trial_dir),
+        mean_ttft_ms=metrics.mean_ttft_ms,
+        mean_tpot_ms=metrics.mean_tpot_ms,
+        mean_itl_ms=metrics.mean_itl_ms,
     )
 
 
@@ -425,6 +431,9 @@ def _aggregate(results: list[TrialResult], output_dir: Path) -> None:
             mode_results = by_policy_mode[(policy, mode)]
             throughputs = [result.output_throughput_toks_s for result in mode_results]
             dram = [result.dram_avg_pct for result in mode_results]
+            ttft = [result.mean_ttft_ms for result in mode_results]
+            tpot = [result.mean_tpot_ms for result in mode_results]
+            itl = [result.mean_itl_ms for result in mode_results]
             summary_rows.append(
                 {
                     "scheduling_policy": policy,
@@ -434,6 +443,12 @@ def _aggregate(results: list[TrialResult], output_dir: Path) -> None:
                     "throughput_stdev_toks_s": _stdev(throughputs),
                     "dram_avg_mean_pct": _mean(dram),
                     "dram_avg_stdev_pct": _stdev(dram),
+                    "mean_ttft_mean_ms": _mean(ttft),
+                    "mean_ttft_stdev_ms": _stdev(ttft),
+                    "mean_tpot_mean_ms": _mean(tpot),
+                    "mean_tpot_stdev_ms": _stdev(tpot),
+                    "mean_itl_mean_ms": _mean(itl),
+                    "mean_itl_stdev_ms": _stdev(itl),
                 }
             )
     _write_csv(summary_rows, output_dir / "summary.csv")
@@ -470,6 +485,12 @@ def _aggregate(results: list[TrialResult], output_dir: Path) -> None:
                         async_result.dram_avg_pct,
                         sync_result.dram_avg_pct,
                     ),
+                    "async_mean_ttft_ms": async_result.mean_ttft_ms,
+                    "sync_mean_ttft_ms": sync_result.mean_ttft_ms,
+                    "ttft_delta_ms": (async_result.mean_ttft_ms - sync_result.mean_ttft_ms),
+                    "async_mean_tpot_ms": async_result.mean_tpot_ms,
+                    "sync_mean_tpot_ms": sync_result.mean_tpot_ms,
+                    "tpot_delta_ms": (async_result.mean_tpot_ms - sync_result.mean_tpot_ms),
                 }
             )
     _write_csv(pairs, output_dir / "paired_comparison.csv")
@@ -481,6 +502,9 @@ def _aggregate(results: list[TrialResult], output_dir: Path) -> None:
         for metric, field in (
             ("output_throughput_toks_s", "output_throughput_toks_s"),
             ("dram_avg_pct", "dram_avg_pct"),
+            ("mean_ttft_ms", "mean_ttft_ms"),
+            ("mean_tpot_ms", "mean_tpot_ms"),
+            ("mean_itl_ms", "mean_itl_ms"),
         ):
             sync_values = [float(getattr(result, field)) for result in by_policy_mode[(policy, "sync")]]
             async_values = [float(getattr(result, field)) for result in by_policy_mode[(policy, "async")]]
@@ -506,6 +530,9 @@ def _aggregate(results: list[TrialResult], output_dir: Path) -> None:
             )
         throughput = policy_metrics["output_throughput_toks_s"]
         dram = policy_metrics["dram_avg_pct"]
+        ttft = policy_metrics["mean_ttft_ms"]
+        tpot = policy_metrics["mean_tpot_ms"]
+        itl = policy_metrics["mean_itl_ms"]
         policy_comparison_rows.append(
             {
                 "scheduling_policy": policy,
@@ -522,6 +549,18 @@ def _aggregate(results: list[TrialResult], output_dir: Path) -> None:
                 "async_dram_stdev_pct": dram[3],
                 "dram_delta_pct_points": dram[2] - dram[0],
                 "dram_change_pct": _change_pct(dram[2], dram[0]),
+                "sync_mean_ttft_ms": ttft[0],
+                "async_mean_ttft_ms": ttft[2],
+                "ttft_delta_ms": ttft[2] - ttft[0],
+                "ttft_change_pct": _change_pct(ttft[2], ttft[0]),
+                "sync_mean_tpot_ms": tpot[0],
+                "async_mean_tpot_ms": tpot[2],
+                "tpot_delta_ms": tpot[2] - tpot[0],
+                "tpot_change_pct": _change_pct(tpot[2], tpot[0]),
+                "sync_mean_itl_ms": itl[0],
+                "async_mean_itl_ms": itl[2],
+                "itl_delta_ms": itl[2] - itl[0],
+                "itl_change_pct": _change_pct(itl[2], itl[0]),
             }
         )
     _write_csv(impact_rows, output_dir / "impact.csv")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,9 @@ class BenchMetrics:
     total_output_tokens: int
     completed_requests: int
     failed_requests: int
+    mean_ttft_ms: float
+    mean_tpot_ms: float
+    mean_itl_ms: float
     source: str
 
 
@@ -28,6 +32,18 @@ _STDOUT_PATTERNS = {
     "total_output": re.compile(r"Total (?:generated|output) tokens:\s*(\d+)", re.IGNORECASE),
     "completed": re.compile(r"Successful requests:\s*(\d+)", re.IGNORECASE),
     "failed": re.compile(r"Failed requests:\s*(\d+)", re.IGNORECASE),
+    "mean_ttft_ms": re.compile(
+        r"Mean TTFT \(ms\):\s*([0-9]+(?:\.[0-9]+)?)",
+        re.IGNORECASE,
+    ),
+    "mean_tpot_ms": re.compile(
+        r"Mean TPOT \(ms\):\s*([0-9]+(?:\.[0-9]+)?)",
+        re.IGNORECASE,
+    ),
+    "mean_itl_ms": re.compile(
+        r"Mean ITL \(ms\):\s*([0-9]+(?:\.[0-9]+)?)",
+        re.IGNORECASE,
+    ),
 }
 
 
@@ -59,6 +75,9 @@ def parse_bench_json(path: Path) -> BenchMetrics:
         total_output_tokens=total_output,
         completed_requests=int(_number(data, "completed")),
         failed_requests=int(_number(data, "failed")),
+        mean_ttft_ms=_number(data, "mean_ttft_ms", math.nan),
+        mean_tpot_ms=_number(data, "mean_tpot_ms", math.nan),
+        mean_itl_ms=_number(data, "mean_itl_ms", math.nan),
         source="json",
     )
 
@@ -83,6 +102,9 @@ def parse_bench_stdout(text: str) -> BenchMetrics:
         total_output_tokens=total_output,
         completed_requests=int(_stdout_match(text, "completed")),
         failed_requests=int(_stdout_match(text, "failed", required=False)),
+        mean_ttft_ms=float(_stdout_match(text, "mean_ttft_ms", required=False)),
+        mean_tpot_ms=float(_stdout_match(text, "mean_tpot_ms", required=False)),
+        mean_itl_ms=float(_stdout_match(text, "mean_itl_ms", required=False)),
         source="stdout",
     )
 
