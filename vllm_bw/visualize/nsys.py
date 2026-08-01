@@ -20,6 +20,24 @@ class DramUtilization:
     metric_names: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class GpuActivityStats:
+    mean_pct: float
+    median_pct: float
+    p5_pct: float
+    p95_pct: float
+    pct_samples_below_10: float
+    pct_samples_above_80: float
+    samples: int
+    metric_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GpuActivityUtilization:
+    sm_active: GpuActivityStats | None
+    gr_active: GpuActivityStats | None
+
+
 def _as_float(value: object) -> float:
     if isinstance(value, int | float | str):
         return float(value)
@@ -39,6 +57,9 @@ def _relevant_metric_clause(alias: str = "i") -> str:
         OR {alias}.metricName LIKE 'SMs Active%'
         OR {alias}.metricName LIKE 'SM Issue%'
         OR {alias}.metricName LIKE 'Tensor Active%'
+        OR {alias}.metricName LIKE 'GR Active%'
+        OR {alias}.metricName LIKE '%GPU Active%'
+        OR {alias}.metricName LIKE '%GPU Utilization%'
     )
     """
 
@@ -160,6 +181,38 @@ def _metric_subset(metrics: pd.DataFrame, contains: str) -> pd.DataFrame:
     return metrics[metrics["metric_name"].str.contains(contains, case=False, na=False)].copy()
 
 
+def _dram_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
+    dram = _metric_subset(metrics, "DRAM")
+    throughput = dram[dram["metric_name"].str.contains("throughput", case=False, na=False)]
+    return throughput if not throughput.empty else dram
+
+
+def _trim_to_active_dram_window(metrics: pd.DataFrame, path: Path) -> pd.DataFrame:
+    dram = _dram_metrics(metrics)
+    active = dram[dram["value"].astype(float) > 0]
+    if active.empty:
+        raise ValueError(f"No active DRAM utilization samples found in {path}")
+    start = active["timestamp"].min()
+    end = active["timestamp"].max()
+    return metrics[(metrics["timestamp"] >= start) & (metrics["timestamp"] <= end)].copy()
+
+
+def _activity_stats(metrics: pd.DataFrame) -> GpuActivityStats | None:
+    if metrics.empty:
+        return None
+    values = metrics["value"].astype(float)
+    return GpuActivityStats(
+        mean_pct=float(values.mean()),
+        median_pct=float(values.median()),
+        p5_pct=float(values.quantile(0.05)),
+        p95_pct=float(values.quantile(0.95)),
+        pct_samples_below_10=float((values < 10).mean() * 100),
+        pct_samples_above_80=float((values > 80).mean() * 100),
+        samples=int(values.size),
+        metric_names=tuple(str(name) for name in metrics["metric_name"].unique()),
+    )
+
+
 def _window_ms(metrics: pd.DataFrame) -> float:
     if metrics.empty:
         return 0.0
@@ -259,6 +312,9 @@ def summarize_nsys(path: Path, measured_only: bool = True) -> list[dict[str, obj
             or "SMs Active" in metric_name_str
             or "SM " in metric_name_str
             or "Tensor" in metric_name_str
+            or "GR Active" in metric_name_str
+            or "GPU Active" in metric_name_str
+            or "GPU Utilization" in metric_name_str
         ):
             continue
         rows.append(
@@ -302,16 +358,8 @@ def extract_dram_utilization(
 ) -> DramUtilization:
     if trim_idle_edges:
         metrics, _, _ = load_nsys_metrics(path, measured_only=measured_only)
-        dram = _metric_subset(metrics, "DRAM")
-        throughput = dram[dram["metric_name"].str.contains("throughput", case=False, na=False)]
-        if not throughput.empty:
-            dram = throughput
-        active = dram[dram["value"].astype(float) > 0]
-        if active.empty:
-            raise ValueError(f"No active DRAM utilization samples found in {path}")
-        start = active["timestamp"].min()
-        end = active["timestamp"].max()
-        dram = dram[(dram["timestamp"] >= start) & (dram["timestamp"] <= end)]
+        metrics = _trim_to_active_dram_window(metrics, path)
+        dram = _dram_metrics(metrics)
         values = dram["value"].astype(float)
         return DramUtilization(
             avg_pct=float(values.mean()),
@@ -343,6 +391,54 @@ def extract_dram_utilization(
         p95_pct=weighted("p95_pct"),
         samples=sample_count,
         metric_names=tuple(str(row["metric_name"]) for row in dram_rows),
+    )
+
+
+def extract_gpu_activity(
+    path: Path,
+    measured_only: bool = False,
+    *,
+    trim_idle_edges: bool = False,
+) -> GpuActivityUtilization:
+    """Extract GPU activity over the same optional active-DRAM window as DRAM stats."""
+    metrics, _, _ = load_nsys_metrics(path, measured_only=measured_only)
+    if metrics.empty:
+        raise ValueError(f"No GPU metrics found in {path}")
+    if trim_idle_edges:
+        metrics = _trim_to_active_dram_window(metrics, path)
+
+    sm_active = _metric_subset(metrics, "SMs Active")
+    gr_active = metrics[
+        metrics["metric_name"].str.contains(
+            r"GR Active|GPU Active|GPU Utilization",
+            case=False,
+            regex=True,
+            na=False,
+        )
+    ].copy()
+    gr_active_pct = gr_active[
+        gr_active["metric_name"].str.contains(
+            r"Throughput %|Utilization %",
+            case=False,
+            regex=True,
+            na=False,
+        )
+    ]
+    if not gr_active_pct.empty:
+        gr_active = gr_active_pct
+    else:
+        # Cycle counts are not percentages and must not feed utilization stats.
+        gr_active = gr_active[
+            ~gr_active["metric_name"].str.contains(
+                "Cycles Active",
+                case=False,
+                regex=False,
+                na=False,
+            )
+        ]
+    return GpuActivityUtilization(
+        sm_active=_activity_stats(sm_active),
+        gr_active=_activity_stats(gr_active),
     )
 
 

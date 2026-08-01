@@ -22,6 +22,7 @@ from vllm_bw.serve_profile import (
     _bench_command,
     _run_and_log,
     _server_command,
+    _server_environment,
     _terminate_process_group,
     _vllm_executable,
     _wait_for_health,
@@ -84,6 +85,13 @@ def add_scheduling_compare_args(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Fail if vLLM reports that async scheduling was disabled",
+    )
+    parser.add_argument(
+        "--pyspy-duration",
+        type=int,
+        default=0,
+        metavar="SECONDS",
+        help="Record server and child-process CPU stacks with py-spy (0 disables)",
     )
 
 
@@ -168,6 +176,77 @@ def _write_csv(rows: list[dict[str, object]], path: Path) -> None:
         writer = csv.DictWriter(output, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _append_pyspy_warning(log_path: Path, message: str) -> None:
+    warning = f"warning: {message}"
+    print(warning, flush=True)
+    with log_path.open("a") as log:
+        log.write(f"{warning}\n")
+
+
+def _start_pyspy(server_pid: int, duration_s: int, trial_dir: Path) -> subprocess.Popen | None:
+    if duration_s <= 0:
+        return None
+    log_path = trial_dir / "pyspy.log"
+    command = [
+        "py-spy",
+        "record",
+        "--pid",
+        str(server_pid),
+        "--subprocesses",
+        "--native",
+        "--format",
+        "speedscope",
+        "-o",
+        str(trial_dir / "pyspy.speedscope.json"),
+        "-d",
+        str(duration_s),
+    ]
+    print(f"$ {' '.join(command)}", flush=True)
+    try:
+        with log_path.open("w") as log:
+            return subprocess.Popen(
+                command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+    except OSError as exc:
+        _append_pyspy_warning(log_path, f"could not start py-spy: {exc}")
+        return None
+
+
+def _finish_pyspy(
+    process: subprocess.Popen | None,
+    duration_s: int,
+    trial_dir: Path,
+) -> None:
+    if process is None:
+        return
+    log_path = trial_dir / "pyspy.log"
+    try:
+        returncode = process.wait(timeout=duration_s + 60)
+    except subprocess.TimeoutExpired:
+        _append_pyspy_warning(
+            log_path,
+            f"py-spy exceeded its {duration_s + 60}s wait timeout; terminating it",
+        )
+        try:
+            process.terminate()
+            try:
+                returncode = process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                returncode = process.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            _append_pyspy_warning(log_path, f"could not stop py-spy: {exc}")
+            return
+    except OSError as exc:
+        _append_pyspy_warning(log_path, f"could not wait for py-spy: {exc}")
+        return
+    if returncode != 0:
+        _append_pyspy_warning(log_path, f"py-spy exited with status {returncode}")
 
 
 _TIMING_PATTERN = re.compile(
@@ -259,6 +338,8 @@ def _run_trial(
     trial_dir = args.output_dir / "trials" / f"trial_{trial_id:03d}_{policy}_{mode}"
     trial_dir.mkdir(parents=True, exist_ok=True)
     trial_args.log_dir = trial_dir
+    if args.torch_profile_dir is not None:
+        trial_args.torch_profile_dir = trial_dir / "torch_profile"
 
     result_path = trial_dir / "bench_result.json"
     bench_log_path = trial_dir / "bench_nsys.log"
@@ -277,6 +358,12 @@ def _run_trial(
             "seed": trial_args.seed,
         },
     )
+    pyspy_config = {
+        "requested": trial_args.pyspy_duration > 0,
+        "ran": False,
+        "duration_s": trial_args.pyspy_duration,
+        "output": (str(trial_dir / "pyspy.speedscope.json") if trial_args.pyspy_duration > 0 else None),
+    }
     config = {
         "trial_id": trial_id,
         "scheduling_policy": policy,
@@ -286,6 +373,8 @@ def _run_trial(
         "vllm_version": environment["vllm_version"],
         "server_argv": server_cmd,
         "bench_argv": bench_cmd,
+        "pyspy": pyspy_config,
+        "torch_profile_dir": (str(trial_args.torch_profile_dir) if trial_args.torch_profile_dir is not None else None),
     }
     (trial_dir / "trial_config.json").write_text(json.dumps(config, indent=2) + "\n")
 
@@ -295,6 +384,7 @@ def _run_trial(
         server_cmd,
         stdout=server_log,
         stderr=subprocess.STDOUT,
+        env=_server_environment(trial_args),
         start_new_session=True,
         text=True,
     )
@@ -305,36 +395,51 @@ def _run_trial(
             trial_args.server_timeout_s,
         )
         if trial_args.warmup_prompts > 0:
-            warmup_cmd = _bench_command(trial_args, model, trial_args.warmup_prompts)
+            warmup_cmd = _bench_command(
+                trial_args,
+                model,
+                trial_args.warmup_prompts,
+                enable_profile=False,
+            )
             _run_and_log(
                 warmup_cmd,
                 trial_dir / "warmup.log",
                 trial_args.bench_timeout_s,
             )
 
-        if trial_args.collect_dram:
-            nsys_cmd = [
-                "nsys",
-                "profile",
-                "--trace",
-                trial_args.nsys_trace,
-                "--gpu-metrics-devices",
-                trial_args.nsys_gpu_metrics_devices,
-                "--gpu-metrics-frequency",
-                str(trial_args.nsys_gpu_metrics_frequency),
-                "--duration",
-                "0",
-                "--output",
-                str(profile_prefix),
-                "--force-overwrite=true",
-                *bench_cmd,
-            ]
-            nsys_output = _run_and_log(nsys_cmd, bench_log_path, trial_args.bench_timeout_s)
-            profile_failure = _nsys_profile_failure(nsys_output)
-            if profile_failure:
-                raise RuntimeError(f"NSYS GPU metric collection failed: {profile_failure}")
-        else:
-            _run_and_log(bench_cmd, bench_log_path, trial_args.bench_timeout_s)
+        pyspy = _start_pyspy(server.pid, trial_args.pyspy_duration, trial_dir)
+        pyspy_config["ran"] = pyspy is not None
+        (trial_dir / "trial_config.json").write_text(json.dumps(config, indent=2) + "\n")
+        try:
+            if trial_args.collect_dram:
+                nsys_cmd = [
+                    "nsys",
+                    "profile",
+                    "--trace",
+                    trial_args.nsys_trace,
+                    "--gpu-metrics-devices",
+                    trial_args.nsys_gpu_metrics_devices,
+                    "--gpu-metrics-frequency",
+                    str(trial_args.nsys_gpu_metrics_frequency),
+                    "--duration",
+                    "0",
+                    "--output",
+                    str(profile_prefix),
+                    "--force-overwrite=true",
+                    *bench_cmd,
+                ]
+                nsys_output = _run_and_log(
+                    nsys_cmd,
+                    bench_log_path,
+                    trial_args.bench_timeout_s,
+                )
+                profile_failure = _nsys_profile_failure(nsys_output)
+                if profile_failure:
+                    raise RuntimeError(f"NSYS GPU metric collection failed: {profile_failure}")
+            else:
+                _run_and_log(bench_cmd, bench_log_path, trial_args.bench_timeout_s)
+        finally:
+            _finish_pyspy(pyspy, trial_args.pyspy_duration, trial_dir)
     finally:
         _terminate_process_group(server)
         server_log.close()
@@ -609,6 +714,8 @@ def _plot_comparison(summary_rows: list[dict[str, object]], output: Path) -> Non
 def run_scheduling_comparison(args: argparse.Namespace) -> int:
     if args.repetitions < 1:
         raise ValueError("--repetitions must be at least 1")
+    if args.pyspy_duration < 0:
+        raise ValueError("--pyspy-duration must be nonnegative")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model = resolve_model(args.model)
     policies = list(dict.fromkeys(args.scheduling_policies or [args.scheduling_policy]))
@@ -633,9 +740,12 @@ def run_scheduling_comparison(args: argparse.Namespace) -> int:
         "created_at": datetime.now(UTC).isoformat(),
         "environment": environment,
         "model": model,
+        "attention_backend": args.attention_backend,
         "scheduling_policies": policies,
         "repetitions": args.repetitions,
         "collect_dram": args.collect_dram,
+        "pyspy_duration_s": args.pyspy_duration,
+        "torch_profile_enabled": args.torch_profile_dir is not None,
         "scheduler_profiling": {
             "enabled": os.environ.get("VLLM_BW_PROFILE_SCHEDULER") == "1",
             "interval": os.environ.get("VLLM_BW_PROFILE_INTERVAL", "100"),

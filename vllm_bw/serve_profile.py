@@ -114,6 +114,8 @@ def _server_command(args: argparse.Namespace, model: str) -> list[str]:
         cmd.append("--trust-remote-code")
     if args.enable_prefix_caching:
         cmd.append("--enable-prefix-caching")
+    if args.attention_backend:
+        cmd.extend(["--attention-backend", args.attention_backend])
     scheduling_policy = getattr(args, "scheduling_policy", None)
     if scheduling_policy:
         cmd.extend(["--scheduling-policy", scheduling_policy])
@@ -122,7 +124,40 @@ def _server_command(args: argparse.Namespace, model: str) -> list[str]:
         cmd.append("--async-scheduling")
     elif scheduling_mode == "sync":
         cmd.append("--no-async-scheduling")
+    torch_profile_dir = getattr(args, "torch_profile_dir", None)
+    if torch_profile_dir is not None:
+        profile_dir = Path(torch_profile_dir).resolve()
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        cmd.extend(
+            [
+                "--profiler-config",
+                json.dumps(
+                    {
+                        "profiler": "torch",
+                        "torch_profiler_dir": str(profile_dir),
+                        "warmup_iterations": 1,
+                        "active_iterations": 5,
+                    }
+                ),
+            ]
+        )
     return cmd
+
+
+def _server_environment(args: argparse.Namespace) -> dict[str, str]:
+    env = os.environ.copy()
+    if getattr(args, "pyspy_duration", 0) > 0:
+        bootstrap_dir = Path(__file__).resolve().parent / "_pyspy_bootstrap"
+        current_pythonpath = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = (
+            f"{bootstrap_dir}{os.pathsep}{current_pythonpath}" if current_pythonpath else str(bootstrap_dir)
+        )
+        env["VLLM_BW_ALLOW_PYSPY"] = "1"
+    torch_profile_dir = getattr(args, "torch_profile_dir", None)
+    if torch_profile_dir is not None:
+        torch_profile_dir = Path(torch_profile_dir)
+        torch_profile_dir.mkdir(parents=True, exist_ok=True)
+    return env
 
 
 def _bench_command(
@@ -132,6 +167,7 @@ def _bench_command(
     *,
     result_path: Path | None = None,
     metadata: dict[str, object] | None = None,
+    enable_profile: bool = True,
 ) -> list[str]:
     cmd = [
         _vllm_executable(args),
@@ -166,6 +202,8 @@ def _bench_command(
         cmd.extend(["--max-concurrency", str(args.max_concurrency)])
     if args.ignore_eos:
         cmd.append("--ignore-eos")
+    if enable_profile and getattr(args, "torch_profile_dir", None) is not None:
+        cmd.append("--profile")
     if result_path is not None:
         result_path.parent.mkdir(parents=True, exist_ok=True)
         cmd.extend(
@@ -215,6 +253,7 @@ def run_serve_profile(args: argparse.Namespace) -> int:
                 "dtype": args.dtype,
                 "max_model_len": args.max_model_len,
                 "max_num_seqs": args.max_num_seqs,
+                "attention_backend": args.attention_backend,
                 "random_input_len": args.random_input_len,
                 "random_prefix_len": args.random_prefix_len,
                 "random_output_len": args.random_output_len,
@@ -224,6 +263,7 @@ def run_serve_profile(args: argparse.Namespace) -> int:
                 "scheduling_policy": args.scheduling_policy,
                 "scheduling_mode": args.scheduling_mode,
                 "nvtx_range": _MEASURED_RANGE,
+                "torch_profile_dir": (str(args.torch_profile_dir) if args.torch_profile_dir is not None else None),
             },
             indent=2,
         )
@@ -237,6 +277,7 @@ def run_serve_profile(args: argparse.Namespace) -> int:
         server_cmd,
         stdout=server_log,
         stderr=subprocess.STDOUT,
+        env=_server_environment(args),
         start_new_session=True,
         text=True,
     )
@@ -246,7 +287,12 @@ def run_serve_profile(args: argparse.Namespace) -> int:
         print("vLLM server is healthy", flush=True)
 
         if args.warmup_prompts > 0:
-            warmup_cmd = _bench_command(args, model, args.warmup_prompts)
+            warmup_cmd = _bench_command(
+                args,
+                model,
+                args.warmup_prompts,
+                enable_profile=False,
+            )
             _run_and_log(warmup_cmd, args.log_dir / "warmup.log", args.bench_timeout_s)
 
         bench_cmd = _bench_command(
@@ -290,6 +336,7 @@ def run_client_nsys_profile(args: argparse.Namespace) -> int:
         server_cmd,
         stdout=server_log,
         stderr=subprocess.STDOUT,
+        env=_server_environment(args),
         start_new_session=True,
         text=True,
     )
@@ -300,7 +347,12 @@ def run_client_nsys_profile(args: argparse.Namespace) -> int:
         print("vLLM server is healthy", flush=True)
 
         if args.warmup_prompts > 0:
-            warmup_cmd = _bench_command(args, model, args.warmup_prompts)
+            warmup_cmd = _bench_command(
+                args,
+                model,
+                args.warmup_prompts,
+                enable_profile=False,
+            )
             _run_and_log(warmup_cmd, args.log_dir / "warmup.log", args.bench_timeout_s)
 
         bench_cmd = _bench_command(
@@ -375,6 +427,10 @@ def add_serve_profile_args(parser: argparse.ArgumentParser) -> None:
         default=True,
         help="Enable vLLM automatic prefix caching",
     )
+    parser.add_argument(
+        "--attention-backend",
+        help="Attention backend passed to `vllm serve` (for example FLASH_ATTN)",
+    )
     parser.add_argument("--bench-backend", default="openai", help="Backend passed to `vllm bench serve`")
     parser.add_argument("--endpoint", default="/v1/completions")
     parser.add_argument("--random-input-len", type=int, default=2048)
@@ -408,6 +464,11 @@ def add_serve_profile_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--server-timeout-s", type=float, default=900)
     parser.add_argument("--bench-timeout-s", type=float, default=1800)
+    parser.add_argument(
+        "--torch-profile-dir",
+        type=Path,
+        help=("Enable vLLM's torch profiler for the measured benchmark and write traces to this directory"),
+    )
     parser.add_argument("--log-dir", type=Path, default=Path("results/vllm_bw_serve_logs"))
 
 
