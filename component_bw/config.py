@@ -147,7 +147,10 @@ def layout_for_stage(stage: StageName, layout: LayoutName) -> LayoutName:
 
 
 def estimate_layer_param_count(
-    config: SyntheticConfig, include_attention: bool = True, include_mlp: bool = True
+    config: SyntheticConfig,
+    include_attention: bool = True,
+    include_mlp: bool = True,
+    include_norms: bool = True,
 ) -> int:
     attention = 0
     if include_attention:
@@ -161,28 +164,32 @@ def estimate_layer_param_count(
     if include_mlp:
         mlp = 3 * config.hidden_size * config.intermediate_size
 
-    norms = 2 * config.hidden_size
+    norms = 2 * config.hidden_size if include_norms else 0
     return attention + mlp + norms
 
 
-def estimate_param_bytes(stage: StageName, config: SyntheticConfig) -> int:
+def estimate_param_count(stage: StageName, config: SyntheticConfig) -> int:
     if stage == "attention_kernel":
         return 0
     if stage in {"attention_layer", "paged_attention"}:
-        return estimate_layer_param_count(config, include_mlp=False) * config.dtype_bytes
+        return estimate_layer_param_count(config, include_mlp=False, include_norms=False)
     if stage == "mlp":
-        return estimate_layer_param_count(config, include_attention=False) * config.dtype_bytes
+        return estimate_layer_param_count(config, include_attention=False, include_norms=False)
     if stage == "block":
-        return estimate_layer_param_count(config) * config.dtype_bytes
+        return estimate_layer_param_count(config)
     if stage == "blocks":
-        return estimate_layer_param_count(config) * config.num_layers * config.dtype_bytes
+        return estimate_layer_param_count(config) * config.num_layers
     if stage in {"model", "paged_model"}:
         block_params = estimate_layer_param_count(config) * config.num_layers
         embedding_params = config.vocab_size * config.hidden_size
         lm_head_params = config.hidden_size * config.vocab_size
         final_norm_params = config.hidden_size
-        return (block_params + embedding_params + lm_head_params + final_norm_params) * config.dtype_bytes
+        return block_params + embedding_params + lm_head_params + final_norm_params
     raise ValueError(f"unknown stage {stage}")
+
+
+def estimate_param_bytes(stage: StageName, config: SyntheticConfig) -> int:
+    return estimate_param_count(stage, config) * config.dtype_bytes
 
 
 def estimate_kv_cache_bytes(stage: StageName, config: SyntheticConfig, batch_size: int) -> int:

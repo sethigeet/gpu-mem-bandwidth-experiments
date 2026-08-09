@@ -1,107 +1,71 @@
-# Component Bandwidth 10K Shared-prefix Report
+# Component Bandwidth 10K Shared-prefix Batch Sweep
 
 ## Methodology
 
-- Workload: Phi-3-mini-shaped synthetic decode ladder with `prefix_len=10000`, `dtype=fp16`, `layout=shared`, and `batch_size=auto`.
-- Throughput source: `results/component_bw_nsys_10k_metrics.csv` from the full component matrix run. This measures wall-clock decode throughput with CUDA synchronization around each measured stage.
-- Bandwidth source: per-stage Nsight Compute CSVs matched by `results/component_bw_ncu_10k_*.csv`. NCU profiles one measured decode token per stage with warmup excluded through `component_bw:<stage>:iter` NVTX filtering.
-- Counters: `dram__bytes_read.sum`, `dram__bytes_write.sum`, `dram__throughput.avg.pct_of_peak_sustained_elapsed`, `sm__throughput.avg.pct_of_peak_sustained_elapsed`, and `gpu__time_duration.sum`.
-- Aggregation: effective GB/s is total read+write bytes divided by total profiled kernel duration. DRAM/SM percentages are duration-weighted averages across kernels in each stage.
-- Caveat: NCU replays kernels to collect counters, so its duration and bandwidth are reliable for hardware-counter attribution but are not the same measurement as wall-clock throughput.
+- Hardware: NVIDIA RTX 6000 Ada Generation (48 GB).
+- Workload: Phi-3-mini-shaped synthetic decode ladder with `prefix_len=10000`, `dtype=fp16`, and `layout=shared`.
+- Batch sizes: `1, 2, 4, 8, 16, 32, 40, 48, 64, 128, 256, 512, 1024`, subject to each stage's memory limit.
+- Throughput: 64 measured decode iterations after five warmup iterations, with CUDA synchronization around each stage.
+- DRAM utilization: Nsight Compute profiles one measured decode iteration per stage and batch size. Warmup is excluded by the `component_bw:<stage>:iter` NVTX filter.
+- NCU counters: `dram__throughput.avg.pct_of_peak_sustained_elapsed` and `gpu__time_duration.sum`.
+- Aggregation: reported DRAM utilization is the kernel-duration-weighted mean across the measured stage.
+- Saturation batch: the first measured batch that reaches at least 95% of that stage's maximum observed throughput.
+
+The paged approximation gathers 10K-token K/V blocks into batch-sized dense tensors. Its memory use therefore grows much faster with batch size than the shared dense-cache stages. Infeasible points are recorded as explicit skips instead of aborting the sweep.
+
+## Component Parameter Counts
+
+These are the trainable tensor parameters instantiated by each synthetic stage. They exclude the K/V cache and temporary activations, which are runtime data rather than model parameters. All projections are bias-free. Parameter storage assumes the benchmark's FP16 dtype.
+
+| stage | included modules | parameters | FP16 parameter storage |
+| --- | --- | ---: | ---: |
+| attention_kernel | direct SDPA only | 0 | 0 B |
+| attention_layer | Q, K, V, and output projections | 37,748,736 (37.75M) | 72.00 MiB |
+| mlp | gate, up, and down projections | 75,497,472 (75.50M) | 144.00 MiB |
+| block | attention + MLP + two RMSNorms | 113,252,352 (113.25M) | 216.01 MiB |
+| blocks | 32 decoder blocks | 3,624,075,264 (3.624B) | 6.75 GiB |
+| model | embeddings + 32 blocks + final norm + LM head | 3,821,079,552 (3.821B) | 7.12 GiB |
+| paged_attention | same parameterized attention layer; paged K/V is runtime state | 37,748,736 (37.75M) | 72.00 MiB |
+| paged_model | same model parameters; paged K/V is runtime state | 3,821,079,552 (3.821B) | 7.12 GiB |
 
 ## Results
 
-![Component bandwidth summary](component_bw_10k_report.png)
+![Component throughput and DRAM utilization versus batch size](../results/component_bw_10k_batch_sweep_report.png)
 
-### Stage Summary
+### Saturation Summary
 
-| stage            | batch_size | throughput_toks_s | per_token_ms | ncu_bandwidth_gb_s | ncu_dram_pct_weighted | ncu_sm_pct_weighted | kernel_count |
-| ---------------- | ---------- | ----------------- | ------------ | ------------------ | --------------------- | ------------------- | ------------ |
-| attention_kernel | 256        | 9655.60           | 0.10         | 7.75               | 0.85                  | 86.49               | 1            |
-| attention_layer  | 256        | 10555.30          | 0.09         | 12.55              | 1.38                  | 85.92               | 5            |
-| mlp              | 256        | 935397.28         | 0.00         | 541.51             | 59.48                 | 48.05               | 5            |
-| block            | 256        | 10097.80          | 0.10         | 24.36              | 2.68                  | 84.79               | 28           |
-| blocks           | 256        | 288.21            | 3.47         | 23.35              | 2.56                  | 84.86               | 896          |
-| model            | 256        | 276.39            | 3.62         | 23.54              | 2.59                  | 84.83               | 907          |
-| paged_attention  | 69         | 914.78            | 1.09         | 833.77             | 91.50                 | 35.21               | 21           |
-| paged_model      | 44         | 28.20             | 35.47        | 828.06             | 90.88                 | 34.38               | 1195         |
-
-### NCU Kernel-type Time Breakdown
-
-| stage            | kernel_type  | kernel_count | ncu_duration_ms | ncu_bandwidth_gb_s | ncu_dram_pct_weighted | ncu_sm_pct_weighted |
-| ---------------- | ------------ | ------------ | --------------- | ------------------ | --------------------- | ------------------- |
-| attention_kernel | attention    | 1            | 16.54           | 7.75               | 0.85                  | 86.49               |
-| attention_layer  | linear       | 4            | 0.18            | 459.08             | 50.43                 | 31.63               |
-| attention_layer  | attention    | 1            | 16.55           | 7.74               | 0.85                  | 86.51               |
-| mlp              | linear       | 3            | 0.30            | 532.75             | 58.50                 | 50.52               |
-| mlp              | activation   | 2            | 0.02            | 682.55             | 75.29                 | 8.26                |
-| block            | linear       | 7            | 0.48            | 500.52             | 54.97                 | 44.05               |
-| block            | other        | 2            | 0.02            | 307.81             | 33.88                 | 0.76                |
-| block            | activation   | 18           | 0.09            | 495.37             | 54.80                 | 8.01                |
-| block            | attention    | 1            | 16.61           | 7.71               | 0.85                  | 86.49               |
-| blocks           | activation   | 576          | 2.88            | 492.13             | 54.42                 | 7.89                |
-| blocks           | linear       | 224          | 15.47           | 496.82             | 54.56                 | 43.95               |
-| blocks           | other        | 64           | 0.65            | 312.54             | 34.45                 | 0.77                |
-| blocks           | attention    | 32           | 555.28          | 7.39               | 0.81                  | 86.50               |
-| model            | paged_gather | 1            | 0.00            | 377.88             | 41.89                 | 3.51                |
-| model            | activation   | 583          | 2.91            | 491.71             | 54.37                 | 7.91                |
-| model            | other        | 66           | 0.69            | 325.26             | 35.85                 | 1.64                |
-| model            | linear       | 225          | 15.84           | 498.88             | 54.79                 | 44.71               |
-| model            | attention    | 32           | 560.82          | 7.32               | 0.80                  | 86.47               |
-| paged_attention  | paged_gather | 8            | 20.28           | 831.64             | 91.27                 | 48.58               |
-| paged_attention  | activation   | 8            | 20.74           | 811.53             | 89.06                 | 23.88               |
-| paged_attention  | linear       | 4            | 0.11            | 694.10             | 76.32                 | 20.16               |
-| paged_attention  | attention    | 1            | 9.71            | 887.35             | 97.38                 | 31.67               |
-| paged_model      | paged_gather | 129          | 427.49          | 833.57             | 91.48                 | 47.82               |
-| paged_model      | activation   | 711          | 439.73          | 809.83             | 88.88                 | 23.69               |
-| paged_model      | other        | 66           | 0.67            | 63.89              | 7.04                  | 0.30                |
-| paged_model      | linear       | 257          | 9.97            | 759.84             | 83.48                 | 13.96               |
-| paged_model      | attention    | 32           | 210.51          | 860.65             | 94.46                 | 30.51               |
+| stage | saturation batch (95%) | peak batch | peak throughput (tok/s) | DRAM util at peak | largest feasible batch | endpoint throughput (tok/s) | endpoint DRAM util |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| attention_kernel | 2 | 2 | 14,119.90 | 93.15% | 1024 | 9,069.98 | 0.21% |
+| attention_layer | 4 | 40 | 10,539.44 | 7.40% | 1024 | 9,447.82 | 0.30% |
+| mlp | 512 | 512 | 1,170,219.72 | 38.14% | 1024 | 1,080,316.53 | 26.91% |
+| block | 40 | 256 | 9,509.33 | 2.70% | 1024 | 9,273.03 | 1.02% |
+| blocks | 256 | 256 | 293.84 | 2.71% | 512 | 289.15 | 1.54% |
+| model | 256 | 256 | 294.21 | 2.76% | 512 | 289.69 | 1.58% |
+| paged_attention | 2 | 4 | 1,279.07 | 88.26% | 64 | 1,028.46 | 91.43% |
+| paged_model | 4 | 4 | 34.66 | 86.80% | 40 | 31.26 | 91.31% |
 
 ## Interpretation
 
-- The biggest throughput drop occurs when moving from one block to all 32 blocks, which is expected because the stage multiplies attention and MLP work by layer count.
-- The paged model stage is much slower than the dense shared full model in this PyTorch approximation because page gathering materializes dense K/V tensors and adds substantial indexing/copy overhead.
-- Use the NCU DRAM/SM columns above as the reliable bandwidth/utilization source for this run. The earlier NSYS GPU-metric timeline failed on this host with a GPU metric ordering error and was not used for bandwidth conclusions.
+1. **The full dense stack saturates around batch 256.** `blocks` and `model` peak at 293.84 and 294.21 tok/s, respectively, at batch 256. Batch 512 changes throughput by less than 2%. Batch 1024 exceeds the runtime memory limit for these two stages.
+
+2. **The MLP needs the largest batch to saturate.** Its throughput scales to 1.17 million tok/s at batch 512, then falls by 7.7% at batch 1024. Its peak weighted DRAM utilization is only 38.14%, so peak throughput is not associated with saturating DRAM bandwidth.
+
+3. **The shared-cache attention paths saturate early.** The isolated attention kernel peaks at batch 2. The full attention layer reaches 95% of its observed maximum by batch 4 and peaks at batch 40. Increasing batch size beyond that adds no throughput.
+
+4. **Dense shared-cache DRAM utilization falls as batch grows.** At small batches, the attention and block paths show high instantaneous DRAM utilization. At large batches, reuse of the one physically shared K/V prefix amortizes DRAM traffic while compute and kernel execution grow. Consequently, the large-batch dense model peaks at only 2.76% duration-weighted DRAM utilization; it is not DRAM-bandwidth-bound at saturation in this shared-cache synthetic layout.
+
+5. **The paged approximation is the clear memory-bandwidth bottleneck.** `paged_attention` and `paged_model` remain around 87-91% of peak DRAM throughput while their token throughput saturates by batches 2-4. Page gathering materializes dense K/V tensors, so it both consumes bandwidth and limits the largest feasible batch to 64 for paged attention and 40 for the paged model.
+
+6. **The original batch-32 result hid two different regimes.** Batch 32 was already past saturation for isolated/shared attention and the paged stages, but it was too small to expose the batch-256 full-model plateau or the batch-512 MLP plateau.
 
 ## Artifacts
 
-- Throughput CSV: `results/component_bw_nsys_10k_metrics.csv`
-- NCU stage summary CSV: `results/component_bw_10k_report_ncu_summary.csv`
-- NCU kernel-type summary CSV: `results/component_bw_10k_report_ncu_kernel_types.csv`
-- Plot: `results/component_bw_10k_report.png`
+- Plot: `results/component_bw_10k_batch_sweep_report.png`
+- Combined throughput CSV (remote): `results/component_bw_10k_batch_sweep_combined_throughput.csv`
+- NCU stage summary (remote): `results/component_bw_10k_batch_sweep_report_ncu_summary.csv`
+- NCU kernel-type summary (remote): `results/component_bw_10k_batch_sweep_report_ncu_kernel_types.csv`
+- Generated report (remote): `results/component_bw_10k_batch_sweep_report.md`
+- Remote run log: `results/component_bw_10k_batch_sweep_large.remote.log`
 
-## Fixed Batch 32 Comparison
-
-To make `model` and `paged_model` throughput comparable at the same batch size, I also ran the full 10K shared-prefix ladder with `--batch-size 32`. This keeps the workload in VRAM and removes the auto-batch-size difference from the throughput comparison.
-
-![Fixed batch 32 component bandwidth summary](component_bw_10k_b32_report.png)
-
-### Fixed Batch 32 Stage Summary
-
-| stage            | batch_size | throughput_toks_s | per_token_ms | ncu_bandwidth_gb_s | ncu_dram_pct_weighted | ncu_sm_pct_weighted | kernel_count |
-| ---------------- | ---------- | ----------------- | ------------ | ------------------ | --------------------- | ------------------- | ------------ |
-| attention_kernel | 32         | 10040.87          | 0.10         | 56.24              | 6.17                  | 77.66               | 64.00        |
-| attention_layer  | 32         | 11015.73          | 0.09         | 89.73              | 9.86                  | 74.23               | 576.00       |
-| mlp              | 32         | 162015.06         | 0.01         | 787.28             | 86.49                 | 7.48                | 384.00       |
-| block            | 32         | 9614.84           | 0.10         | 140.99             | 15.49                 | 67.60               | 2112.00      |
-| blocks           | 32         | 272.68            | 3.67         | 139.92             | 15.37                 | 67.63               | 67584.00     |
-| model            | 32         | 268.86            | 3.72         | 141.95             | 15.60                 | 67.44               | 68288.00     |
-| paged_attention  | 32         | 1103.16           | 0.91         | 836.32             | 91.79                 | 34.77               | 832.00       |
-| paged_model      | 32         | 31.73             | 31.51        |                    |                       |                     |              |
-
-The fixed-batch throughput comparison is the clean apples-to-apples result:
-
-- `model` at batch 32: `268.86 tok/s`
-- `paged_model` at batch 32: `31.73 tok/s`
-- `paged_model` is about `8.5x` slower at the same batch size.
-
-NCU counters are available through `paged_attention`. The fixed-batch `paged_model` NCU stage was stopped after more than 15 hours of active GPU execution, so it is intentionally omitted from the fixed-batch NCU summary. The earlier auto-batch `paged_model` NCU result remains useful as contextual evidence that the PyTorch paged-KV approximation is highly memory-bandwidth bound.
-
-Fixed-batch artifacts:
-
-- Report: `results/component_bw_10k_b32_report.md`
-- Throughput CSV: `results/component_bw_10k_b32_throughput.csv`
-- NCU stage summary CSV: `results/component_bw_10k_b32_report_ncu_summary.csv`
-- NCU kernel-type summary CSV: `results/component_bw_10k_b32_report_ncu_kernel_types.csv`
-- Plot: `results/component_bw_10k_b32_report.png`
+NCU uses kernel replay, so its profiled wall times are not throughput measurements. Throughput and DRAM-utilization values come from separate runs with the same stage, shape, and batch size.

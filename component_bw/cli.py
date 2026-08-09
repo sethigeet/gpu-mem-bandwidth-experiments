@@ -107,12 +107,29 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = sub.add_parser("run", help="Run one staged component benchmark")
     run_parser.add_argument("--stage", choices=STAGES, default="attention_kernel")
     run_parser.add_argument("--output", "-o", type=Path)
+    run_parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
     _add_config_args(run_parser)
 
     matrix_parser = sub.add_parser("matrix", help="Run several stages with the same shape/config")
     matrix_parser.add_argument("--stages", nargs="+", choices=[*STAGES, "all"], default=["all"])
     matrix_parser.add_argument("--output", "-o", type=Path, required=True)
     _add_config_args(matrix_parser)
+
+    sweep_parser = sub.add_parser("sweep", help="Run the component matrix across several batch sizes")
+    sweep_parser.add_argument("--stages", nargs="+", choices=[*STAGES, "all"], default=["all"])
+    sweep_parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=[1, 2, 4, 8, 16, 32, 40, 48, 64, 128, 256, 512, 1024],
+    )
+    sweep_parser.add_argument("--output", "-o", type=Path, required=True)
+    _add_config_args(sweep_parser)
 
     viz_parser = sub.add_parser("visualize", help="Visualize a component CSV or nsys SQLite file")
     viz_parser.add_argument("input", type=Path)
@@ -164,6 +181,39 @@ def run_stage_matrix(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_batch_sweep(args: argparse.Namespace) -> int:
+    _apply_smoke(args)
+    config = _config_from_args(args)
+    stages = _stage_list(args.stages)
+    batch_sizes = sorted(set(args.batch_sizes))
+    if not batch_sizes or any(batch_size <= 0 for batch_size in batch_sizes):
+        raise SystemExit("--batch-sizes must contain positive integers")
+
+    rows = []
+    for batch_size in batch_sizes:
+        batch_config = replace(config, batch_size=batch_size)
+        for stage in stages:
+            try:
+                result = run_stage(stage, batch_config)
+            except RuntimeError as exc:
+                message = str(exc)
+                if not (message.startswith("estimated ") or "out of memory" in message.lower()):
+                    raise
+                print(f"Skipping {stage} at batch={batch_size}: {message}", flush=True)
+                continue
+            print(
+                f"{result.stage}: batch={result.batch_size}, layout={result.layout}, "
+                f"throughput={result.throughput_toks_s:.1f} toks/s, "
+                f"wall={result.wall_time_s:.3f}s",
+                flush=True,
+            )
+            rows.append(result_to_row(result))
+            write_rows(rows, args.output)
+    write_rows(rows, args.output)
+    write_config(config, args.output.with_suffix(".config.json"))
+    return 0
+
+
 def run_visualize(args: argparse.Namespace) -> int:
     if not args.input.exists():
         print(f"Error: {args.input} not found", file=sys.stderr)
@@ -197,6 +247,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_one(args)
     if args.command == "matrix":
         return run_stage_matrix(args)
+    if args.command == "sweep":
+        return run_batch_sweep(args)
     if args.command == "visualize":
         return run_visualize(args)
     if args.command == "report":

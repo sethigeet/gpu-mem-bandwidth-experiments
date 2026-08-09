@@ -155,6 +155,21 @@ The NSYS wrapper writes `results/component_bw_nsys_<ts>.csv` for throughput,
 `_summary.png` for the stage waterfall, `.png` for DRAM/SM timelines, and
 `_nsys_summary.csv` with average/p50/p95/max utilization inside the measured component ranges.
 
+Sweep every component through batch 1024 and collect matching NCU counters. Memory-heavy paged
+stages are skipped after their largest feasible batch instead of aborting the sweep:
+
+```bash
+scripts/component_bw.sh sweep-bundle --remote --detach \
+  --host hinton-01 --remote-dir ~/code/attention-bw \
+  --out results/component_bw_10k_batch_sweep -- \
+  --model phi-3-mini --prefix-len 10000 --decode-tokens 64 --layout shared \
+  --batch-sizes 1 2 4 8 16 32 40 48 64 128 256 512 1024
+```
+
+The sweep uses NCU application replay by default so full-model stages do not pay per-kernel replay
+overhead. Override `COMPONENT_BATCH_SIZES` only if the NCU batch list must differ from the throughput
+list.
+
 ## prefix_bw — Feather prefix-homogeneity reproduction
 
 Reproduces the paper's claim that, because decode is memory-bandwidth bound, batches whose

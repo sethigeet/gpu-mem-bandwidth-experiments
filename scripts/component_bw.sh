@@ -5,9 +5,9 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_remote_lib.sh"
 
 COMMAND=${1:-}
 case "$COMMAND" in
-  ncu|nsys|ncu-matrix|bundle|fetch) ;;
+  ncu|nsys|ncu-matrix|bundle|sweep|ncu-sweep|sweep-bundle|fetch) ;;
   *)
-    echo "Usage: $0 {ncu|nsys|ncu-matrix|bundle|fetch} [--remote] [--detach] [--host HOST] [--remote-dir DIR] [--out PREFIX] -- [benchmark args]" >&2
+    echo "Usage: $0 {ncu|nsys|ncu-matrix|bundle|sweep|ncu-sweep|sweep-bundle|fetch} [--remote] [--detach] [--host HOST] [--remote-dir DIR] [--out PREFIX] -- [benchmark args]" >&2
     exit 2
     ;;
 esac
@@ -55,10 +55,11 @@ case "$COMMAND" in
   ncu)
     ncu \
       --target-processes all \
+      --replay-mode "${NCU_REPLAY_MODE:-kernel}" \
       --nvtx --nvtx-include "regex:component_bw:.*:iter]" \
-      --metrics dram__bytes_read.sum,dram__bytes_write.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__time_duration.sum \
+      --metrics "${NCU_METRICS:-dram__bytes_read.sum,dram__bytes_write.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__time_duration.sum}" \
       --csv --log-file "${OUT}.csv" \
-      uv run component_main.py run --decode-tokens 1 --warmup-tokens 2 "${COMMON_EXTRA[@]}"
+      uv run component_main.py run "${COMMON_EXTRA[@]}" --decode-tokens 1 --warmup-tokens 2
     ;;
   nsys)
     nsys profile \
@@ -91,5 +92,45 @@ case "$COMMAND" in
     uv run component_main.py matrix -o "${OUT}_throughput.csv" "${COMMON_EXTRA[@]}"
     uv run component_main.py visualize "${OUT}_throughput.csv" -o "${OUT}_throughput.png"
     "$0" ncu-matrix --out "${OUT}_ncu" -- "${COMMON_EXTRA[@]}"
+    ;;
+  sweep)
+    uv run component_main.py sweep -o "${OUT}.csv" "${COMMON_EXTRA[@]}"
+    ;;
+  ncu-sweep)
+    while [[ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits)" ]]; do
+      echo "GPU busy; waiting ${GPU_WAIT_INTERVAL_S:-60} seconds"
+      sleep "${GPU_WAIT_INTERVAL_S:-60}"
+    done
+    BATCH_SIZES=${COMPONENT_BATCH_SIZES:-"1 2 4 8 16 32 40 48 64 128 256 512 1024"}
+    for batch_size in $BATCH_SIZES; do
+      for stage in attention_kernel attention_layer mlp block blocks model paged_attention paged_model; do
+        stage_output="${OUT}_b${batch_size}_${stage}"
+        if [[ -f "${stage_output}.done" || -f "${stage_output}.skipped" ]]; then
+          echo "__COMPONENT_NCU_BATCH_${batch_size}_STAGE_SKIPPED_${stage}__"
+          continue
+        fi
+        echo "__COMPONENT_NCU_BATCH_${batch_size}_STAGE_START_${stage}__"
+        if NCU_REPLAY_MODE=${NCU_REPLAY_MODE:-kernel} \
+          NCU_METRICS=${NCU_METRICS:-dram__throughput.avg.pct_of_peak_sustained_elapsed,gpu__time_duration.sum} \
+          "$0" ncu --out "$stage_output" -- \
+          "${COMMON_EXTRA[@]}" --stage "$stage" --batch-size "$batch_size"; then
+          touch "${stage_output}.done"
+          echo "__COMPONENT_NCU_BATCH_${batch_size}_STAGE_DONE_${stage}__"
+        else
+          [[ ! -f "${stage_output}.csv" ]] || mv "${stage_output}.csv" "${stage_output}.failed.log"
+          touch "${stage_output}.skipped"
+          echo "__COMPONENT_NCU_BATCH_${batch_size}_STAGE_INFEASIBLE_${stage}__"
+        fi
+      done
+    done
+    ;;
+  sweep-bundle)
+    while [[ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits)" ]]; do
+      echo "GPU busy; waiting ${GPU_WAIT_INTERVAL_S:-60} seconds"
+      sleep "${GPU_WAIT_INTERVAL_S:-60}"
+    done
+    uv run component_main.py sweep -o "${OUT}_throughput.csv" "${COMMON_EXTRA[@]}"
+    COMPONENT_BATCH_SIZES=${COMPONENT_BATCH_SIZES:-"1 2 4 8 16 32 40 48 64 128 256 512 1024"} \
+      "$0" ncu-sweep --out "${OUT}_ncu" -- "${COMMON_EXTRA[@]}"
     ;;
 esac
