@@ -5,3 +5,4 @@
 - Never run `python -m compileall`
 - Use `ruff` and `ty` via `uvx` to format files, linting and type checking.
 - When running long tasks on the remote server, prefer to run them inside tmux.
+- Try to run all required analysis and computation with generated outputs on the remote itself and just copy the final results (plots, data, etc.) when possible
