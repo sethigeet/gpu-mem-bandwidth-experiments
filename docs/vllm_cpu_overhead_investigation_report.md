@@ -30,6 +30,7 @@ system, not uninstrumented production performance.
 | B: online versus offline | Success after retry | Initial FlashInfer sampler JIT failed; rerun with `VLLM_USE_FLASHINFER_SAMPLER=0` completed |
 | C: torch-profiler window | Success after retry | The old profiler environment variable produced no trace; `--profiler-config` generated a 30.8 MB trace and summary |
 | D: fresh GPU-busy analysis | Success after correction | Two fresh NSYS traces analyzed; GR-active extraction was corrected to exclude cycle-count metrics |
+| E: unaccounted-step drilldown + GPU timing | Success after profiler workaround | Exclusive step regions resolved the remainder; NSYS captured 17K+ kernels per mode, and CUDA events supplied per-call GPU duration after NSYS's child-process projection failed |
 
 ## Instrumented serving results
 
@@ -61,6 +62,37 @@ called the preparation function.
 Async reduced measured EngineCore step time by 16.9%. Most of the reduction was
 in the unaccounted remainder and input preparation, while model execution
 excluding preparation increased.
+
+### Follow-up: resolving the unaccounted remainder
+
+The follow-up separated the profilers and added exclusive regions directly
+inside `EngineCore.step` and `EngineCore.step_with_batch_queue`. This run used
+the same model and 300-request workload but omitted py-spy and NSYS from the CPU
+phase measurement, raising throughput to 707.69 tok/s sync and 721.51 tok/s
+async. Its absolute times therefore should not be mixed with Experiment A, but
+the exclusive breakdown identifies what the previous subtraction called
+"unaccounted."
+
+| Exclusive EngineCore phase | Sync ms/step | Sync % | Async ms/step | Async % |
+| --- | ---: | ---: | ---: | ---: |
+| Scheduler | 1.25 | 1.43 | 1.56 | 2.13 |
+| Execute-model submission | 7.61 | 8.71 | 6.54 | 8.96 |
+| Sync fallback `sample_tokens` | 78.82 | 90.23 | — | — |
+| Async initial sample submission | — | — | 6.73 | 9.23 |
+| Async model/sample future wait | — | — | 58.99 | 80.82 |
+| Update from output | 0.31 | 0.36 | 0.39 | 0.53 |
+| Request checks, grammar, queues, and abort handling | 0.01 | 0.01 | 0.01 | 0.02 |
+| Timer reconciliation error | -0.64 | -0.74 | -1.23 | -1.69 |
+| **EngineCore step** | **87.36** | **100.0** | **72.99** | **100.0** |
+
+The sync remainder is overwhelmingly the fallback call to
+`model_executor.sample_tokens()` after `execute_model()` returns `None`. In the
+async batch-queue path, the corresponding cost appears mainly in
+`future.result()`, with smaller launch-side costs for model and sample
+submission. The small negative reconciliation row is timing/context-manager
+instrumentation overhead, not another execution phase.
+
+![Exclusive EngineCore step breakdown](../results/vllm_cpu_overhead_drilldown_20260809/step_breakdown.png)
 
 Frontend output processing is in a separate process and can overlap EngineCore,
 so it is not additive with the table:
@@ -122,6 +154,38 @@ Async increased mean GR activity by 3.10 percentage points, but did not increase
 instrumented throughput materially. The workload is bursty and GPU-idle
 dominated at this measurement boundary, not continuously memory-bandwidth-bound.
 
+### Follow-up: CPU submission time versus GPU execution time
+
+Separate NSYS runs completed at 712.96 tok/s sync and 740.20 tok/s async and
+captured 17,508 and 17,407 kernels, respectively. The intended NSYS NVTX GPU
+projection could not be used: NSYS 2026.1 recorded the EngineCore child
+process's CUDA timestamps in a different time origin from its NVTX timestamps,
+so NVIDIA's `nvtx_gpu_proj_sum` report returned no range rows despite both the
+ranges and kernels being present in SQLite.
+
+The confirmation pass therefore retained the same NVTX method boundaries and
+placed CUDA events on the model runner's stream around
+`GPUModelRunner.execute_model` and `_prepare_inputs`. It completed at 714.93
+tok/s sync and 741.27 tok/s async.
+
+| Timing boundary | Sync ms/call | Async ms/call |
+| --- | ---: | ---: |
+| CPU `execute_model`, including preparation | 7.55 | 6.46 |
+| CPU input preparation | 2.68 | 1.99 |
+| **CPU execute, excluding preparation** | **4.87** | **4.46** |
+| CUDA-event model range, including preparation | 90.41 | 83.04 |
+| CUDA-event preparation, normalized per model call | 0.89 | 0.49 |
+| **CUDA-event model range, excluding preparation** | **89.52** | **82.56** |
+
+The earlier `execute_model` number is therefore not GPU execution time. It is a
+host-side cumulative function timer around asynchronous CUDA submission. The
+GPU remains active after the Python call returns, which explains why the CUDA
+event duration is much larger. The original 25.39 ms sync and 30.94 ms async
+values from Experiment A are also profiler-inflated CPU wall times; neither is
+a direct measurement of kernel execution duration.
+
+![CPU wall timer versus CUDA-event model duration](../results/vllm_cpu_overhead_drilldown_20260809/model_execution_cpu_vs_gpu.png)
+
 ## Online versus offline throughput
 
 The offline benchmark reported:
@@ -165,13 +229,21 @@ throughput to 207 tok/s, so its timing is diagnostic rather than representative.
 
 ## Where the time goes
 
-1. **Frontend detokenization and token conversion are the clearest CPU
+1. **Model-output completion explains the old EngineCore remainder.** Sync
+   spends 78.82 ms/step in fallback sampling; async spends 58.99 ms/step
+   waiting for the queued model/sample future and 6.73 ms submitting sampling.
+2. **Frontend detokenization and token conversion are the clearest CPU
    hotspot.** Detokenizer updates accumulated 19.2-19.5 seconds, while native
    tokenizer iteration and ID conversion led APIServer py-spy self time.
-2. **Scheduling and input preparation consume about one quarter of each core
-   step.** Together they used 23.69 ms sync and 19.86 ms async per step.
-   Prefix-cache hashing and NumPy packing are visible in EngineCore samples.
-3. **The serving pipeline leaves substantial GPU gaps.** Roughly 72-74% of
+3. **Scheduling and input preparation are profiler-sensitive.** They consumed
+   20-24 ms/step in the combined Experiment A run, but the separated follow-up
+   measured only 1.25-1.56 ms/step for scheduling and 1.99-2.68 ms/call for
+   input preparation. Prefix-cache hashing and NumPy packing remain visible in
+   EngineCore samples.
+4. **The CPU execute timer is launch time, not GPU duration.** CUDA events
+   measured 89.52 ms sync and 82.56 ms async excluding input preparation,
+   versus 4.87 ms and 4.46 ms in the follow-up CPU timer.
+5. **The serving pipeline leaves substantial GPU gaps.** Roughly 72-74% of
    samples were below 10% GR activity, despite individual bursts reaching full
    activity. The low wall-clock DRAM mean is primarily dilution by idle gaps.
 
@@ -186,9 +258,12 @@ throughput to 207 tok/s, so its timing is diagnostic rather than representative.
 3. **Overlap CPU phases with GPU execution:** preserve async output processing,
    prepare the next batch while the current batch executes, and extend warmup to
    cover slot-mapping shapes so Triton JIT does not occur during inference.
-4. **Separate profilers in follow-up runs:** use py-spy at 10-20 Hz without
-   NSYS, and collect timing hooks/NSYS in a separate run. This will produce a
-   representative throughput baseline and avoid the observed sampling backlog.
+4. **Optimize the sampling/completion path:** the detailed step regions show
+   that synchronous fallback sampling and asynchronous future completion, not
+   scheduler bookkeeping, dominate EngineCore wall time in the cleaner run.
+5. **Keep profilers separated:** use py-spy at 10-20 Hz without NSYS, collect
+   CPU timing independently, and use CUDA events or a server-rooted NSYS launch
+   for GPU method duration.
 
 ## Limitations
 
@@ -200,6 +275,14 @@ throughput to 207 tok/s, so its timing is diagnostic rather than representative.
 - py-spy's sampling backlog limits precise self-time attribution.
 - The torch-profiler run captures five iterations under heavy profiler overhead.
 - Offline versus online is a subsystem bound, not a pure HTTP measurement.
+- The follow-up CPU, NSYS, and CUDA-event values come from separate runs; their
+  similar 708-741 tok/s throughput makes them comparable, but they are still
+  single trials.
+- CUDA events measure elapsed work on the instrumented stream. They do not
+  replace a multi-stream critical-path analysis.
+- NSYS raw CUDA traces are valid, but its built-in NVTX GPU projection was not
+  usable for the multiprocess child-worker capture because of timestamp-origin
+  mismatch.
 
 ## Artifacts
 
@@ -207,6 +290,10 @@ throughput to 207 tok/s, so its timing is diagnostic rather than representative.
 - Offline A/B: `results/vllm_offline_ab_10k_retry/`
 - Torch profiler: `results/vllm_torch_profile_10k_retry2/`
 - Corrected GPU activity: `results/gpu_busy_analysis_fresh/`
+- Detailed step and GPU follow-up:
+  `results/vllm_cpu_overhead_drilldown_20260809/`
+- Follow-up combined CSV:
+  `results/vllm_cpu_overhead_drilldown_20260809/combined_summary.csv`
 - Parsed py-spy ranking:
   `results/cpu_overhead_investigation/pyspy_top_self_time.csv`
 - Raw NSYS reports remain on `hinton-01` in the corresponding results directory.

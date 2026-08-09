@@ -33,8 +33,11 @@ from pathlib import Path
 
 _TIMING_SOURCE = Path(__file__).parent / "schedulers/instrumentation/timing.py"
 _TIMING_DESTINATION = Path("vllm/v1/timing.py")
-_TIMING_IMPORT = "from vllm.v1.timing import profile_scheduler_function"
+_OLD_TIMING_IMPORT = "from vllm.v1.timing import profile_scheduler_function"
+_TIMING_IMPORT = "from vllm.v1.timing import (profile_gpu_range, profile_scheduler_function, profile_timing_region)"
 _DECORATOR = "profile_scheduler_function"
+_GPU_DECORATOR = '@profile_gpu_range("vllm_bw:model_execution")'
+_GPU_INPUT_DECORATOR = '@profile_gpu_range("vllm_bw:input_preparation")'
 
 
 @dataclass(frozen=True)
@@ -81,7 +84,11 @@ _TARGETS = (
     FileTarget(
         Path("vllm/v1/worker/gpu_model_runner.py"),
         (
-            MethodTarget("GPUModelRunner.execute_model", ("execute_model",)),
+            MethodTarget(
+                "GPUModelRunner.execute_model",
+                ("execute_model",),
+                required=True,
+            ),
             MethodTarget(
                 "GPUModelRunner input preparation",
                 (
@@ -131,12 +138,14 @@ def _matching_method(
 
 
 def _is_decorated(text: str, match: re.Match[str]) -> bool:
-    line_start = match.start()
-    preceding_line_end = line_start - 1
-    if preceding_line_end < 0:
-        return False
-    preceding_line_start = text.rfind("\n", 0, preceding_line_end) + 1
-    return text[preceding_line_start:preceding_line_end].strip() == f"@{_DECORATOR}"
+    preceding_lines = text[max(0, match.start() - 512) : match.start()].splitlines()
+    decorator_lines: list[str] = []
+    for line in reversed(preceding_lines):
+        stripped = line.strip()
+        if not stripped.startswith("@"):
+            break
+        decorator_lines.append(stripped)
+    return f"@{_DECORATOR}" in decorator_lines
 
 
 def inspect_source_tree(site_packages: Path) -> list[AnchorReport]:
@@ -196,6 +205,8 @@ def _print_reports(reports: list[AnchorReport]) -> None:
 def _insert_timing_import(text: str, path: Path) -> str:
     if _TIMING_IMPORT in text:
         return text
+    if _OLD_TIMING_IMPORT in text:
+        return text.replace(_OLD_TIMING_IMPORT, _TIMING_IMPORT, 1)
     import_match = re.search(r"^(?:import vllm\b|from vllm\b)", text, re.MULTILINE)
     if import_match is None:
         raise RuntimeError(f"Could not locate a vLLM import anchor in {path}")
@@ -217,6 +228,197 @@ def _decorate_matches(
     return text
 
 
+def _decorate_gpu_method(text: str, method_name: str, decorator: str) -> str:
+    match = _method_pattern(method_name).search(text)
+    if match is None or decorator in text[max(0, match.start() - 160) : match.start()]:
+        return text
+    return text[: match.start()] + f"{match.group('indent')}{decorator}\n" + text[match.start() :]
+
+
+def _replace_required(text: str, old: str, new: str, *, label: str) -> str:
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(f"Expected exactly one {label} anchor, found {count}")
+    return text.replace(old, new, 1)
+
+
+def _method_slice(text: str, method_name: str) -> tuple[int, int]:
+    match = _method_pattern(method_name).search(text)
+    if match is None:
+        raise RuntimeError(f"Could not locate required method {method_name}")
+    next_member = re.search(r"^    (?:async\s+)?def\s+", text[match.end() :], re.MULTILINE)
+    end = match.end() + next_member.start() if next_member else len(text)
+    return match.start(), end
+
+
+def _patch_method_regions(text: str, method_name: str, replacements: tuple[tuple[str, str, str], ...]) -> str:
+    start, end = _method_slice(text, method_name)
+    body = text[start:end]
+    for old, new, label in replacements:
+        body = _replace_required(body, old, new, label=f"{method_name}.{label}")
+    return text[:start] + body + text[end:]
+
+
+_SYNC_STEP_REGIONS = (
+    (
+        "        if not self.scheduler.has_requests():\n            return {}, False",
+        '        with profile_timing_region("EngineCore.step::request_check"):\n'
+        "            has_requests = self.scheduler.has_requests()\n"
+        "        if not has_requests:\n            return {}, False",
+        "request_check",
+    ),
+    (
+        "        scheduler_output = self.scheduler.schedule()",
+        '        with profile_timing_region("EngineCore.step::schedule"):\n'
+        "            scheduler_output = self.scheduler.schedule()",
+        "schedule",
+    ),
+    (
+        "        future = self.model_executor.execute_model(scheduler_output, non_block=True)",
+        '        with profile_timing_region("EngineCore.step::execute_model_submit"):\n'
+        "            future = self.model_executor.execute_model(scheduler_output, non_block=True)",
+        "execute_model_submit",
+    ),
+    (
+        "        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)",
+        '        with profile_timing_region("EngineCore.step::grammar_bitmask"):\n'
+        "            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)",
+        "grammar_bitmask",
+    ),
+    (
+        "            model_output = future.result()",
+        '            with profile_timing_region("EngineCore.step::model_future_wait"):\n'
+        "                model_output = future.result()",
+        "model_future_wait",
+    ),
+    (
+        "                model_output = self.model_executor.sample_tokens(grammar_output)",
+        '                with profile_timing_region("EngineCore.step::fallback_sample_tokens"):\n'
+        "                    model_output = self.model_executor.sample_tokens(grammar_output)",
+        "fallback_sample_tokens",
+    ),
+    (
+        "        self._process_aborts_queue()",
+        '        with profile_timing_region("EngineCore.step::process_aborts"):\n'
+        "            self._process_aborts_queue()",
+        "process_aborts",
+    ),
+    (
+        "        engine_core_outputs = self.scheduler.update_from_output(\n"
+        "            scheduler_output, model_output\n        )",
+        '        with profile_timing_region("EngineCore.step::update_from_output"):\n'
+        "            engine_core_outputs = self.scheduler.update_from_output(\n"
+        "                scheduler_output, model_output\n            )",
+        "update_from_output",
+    ),
+)
+
+
+_ASYNC_STEP_REGIONS = (
+    (
+        "        if self.scheduler.has_requests():",
+        '        with profile_timing_region("EngineCore.step_with_batch_queue::request_check"):\n'
+        "            has_requests = self.scheduler.has_requests()\n"
+        "        if has_requests:",
+        "request_check",
+    ),
+    (
+        "            scheduler_output = self.scheduler.schedule()",
+        '            with profile_timing_region("EngineCore.step_with_batch_queue::schedule"):\n'
+        "                scheduler_output = self.scheduler.schedule()",
+        "schedule",
+    ),
+    (
+        "                exec_future = self.model_executor.execute_model(\n"
+        "                    scheduler_output, non_block=True\n                )",
+        '                with profile_timing_region("EngineCore.step_with_batch_queue::execute_model_submit"):\n'
+        "                    exec_future = self.model_executor.execute_model(\n"
+        "                        scheduler_output, non_block=True\n                    )",
+        "execute_model_submit",
+    ),
+    (
+        "                    grammar_output = self.scheduler.get_grammar_bitmask(\n"
+        "                        scheduler_output\n                    )",
+        '                    with profile_timing_region("EngineCore.step_with_batch_queue::initial_grammar_bitmask"):\n'
+        "                        grammar_output = self.scheduler.get_grammar_bitmask(\n"
+        "                            scheduler_output\n                        )",
+        "initial_grammar_bitmask",
+    ),
+    (
+        "                    future = self.model_executor.sample_tokens(\n"
+        "                        grammar_output, non_block=True\n                    )",
+        '                    with profile_timing_region("EngineCore.step_with_batch_queue::initial_sample_submit"):\n'
+        "                        future = self.model_executor.sample_tokens(\n"
+        "                            grammar_output, non_block=True\n                        )",
+        "initial_sample_submit",
+    ),
+    (
+        "                batch_queue.appendleft((future, scheduler_output, exec_future))",
+        '                with profile_timing_region("EngineCore.step_with_batch_queue::queue_append"):\n'
+        "                    batch_queue.appendleft((future, scheduler_output, exec_future))",
+        "queue_append",
+    ),
+    (
+        "        future, scheduler_output, exec_model_fut = batch_queue.pop()",
+        '        with profile_timing_region("EngineCore.step_with_batch_queue::queue_pop"):\n'
+        "            future, scheduler_output, exec_model_fut = batch_queue.pop()",
+        "queue_pop",
+    ),
+    (
+        "            model_output = future.result()",
+        '            with profile_timing_region("EngineCore.step_with_batch_queue::model_future_wait"):\n'
+        "                model_output = future.result()",
+        "model_future_wait",
+    ),
+    (
+        "                exec_model_fut.result()",
+        '                with profile_timing_region("EngineCore.step_with_batch_queue::failed_execute_wait"):\n'
+        "                    exec_model_fut.result()",
+        "failed_execute_wait",
+    ),
+    (
+        "        self._process_aborts_queue()",
+        '        with profile_timing_region("EngineCore.step_with_batch_queue::process_aborts"):\n'
+        "            self._process_aborts_queue()",
+        "process_aborts",
+    ),
+    (
+        "        engine_core_outputs = self.scheduler.update_from_output(\n"
+        "            scheduler_output, model_output\n        )",
+        '        with profile_timing_region("EngineCore.step_with_batch_queue::update_from_output"):\n'
+        "            engine_core_outputs = self.scheduler.update_from_output(\n"
+        "                scheduler_output, model_output\n            )",
+        "update_from_output",
+    ),
+    (
+        "                draft_token_ids = self.model_executor.take_draft_token_ids()",
+        '                with profile_timing_region("EngineCore.step_with_batch_queue::deferred_take_draft_tokens"):\n'
+        "                    draft_token_ids = self.model_executor.take_draft_token_ids()",
+        "deferred_take_draft_tokens",
+    ),
+    (
+        "            grammar_output = self.scheduler.get_grammar_bitmask(\n"
+        "                deferred_scheduler_output\n            )",
+        '            with profile_timing_region("EngineCore.step_with_batch_queue::deferred_grammar_bitmask"):\n'
+        "                grammar_output = self.scheduler.get_grammar_bitmask(\n"
+        "                    deferred_scheduler_output\n                )",
+        "deferred_grammar_bitmask",
+    ),
+    (
+        "            future = self.model_executor.sample_tokens(grammar_output, non_block=True)",
+        '            with profile_timing_region("EngineCore.step_with_batch_queue::deferred_sample_submit"):\n'
+        "                future = self.model_executor.sample_tokens(grammar_output, non_block=True)",
+        "deferred_sample_submit",
+    ),
+    (
+        "            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))",
+        '            with profile_timing_region("EngineCore.step_with_batch_queue::deferred_queue_append"):\n'
+        "                batch_queue.appendleft((future, deferred_scheduler_output, exec_future))",
+        "deferred_queue_append",
+    ),
+)
+
+
 def patch_source_tree(site_packages: Path) -> list[AnchorReport]:
     """Patch an unpacked vLLM installation rooted at site-packages."""
 
@@ -233,6 +435,36 @@ def patch_source_tree(site_packages: Path) -> list[AnchorReport]:
             continue
         original = path.read_text()
         text = original
+        if file_target.relative_path == Path("vllm/v1/engine/core.py"):
+            if "EngineCore.step::request_check" not in text:
+                text = _patch_method_regions(text, "step", _SYNC_STEP_REGIONS)
+            if "EngineCore.step_with_batch_queue::request_check" not in text:
+                text = _patch_method_regions(
+                    text,
+                    "step_with_batch_queue",
+                    _ASYNC_STEP_REGIONS,
+                )
+        if file_target.relative_path == Path("vllm/v1/worker/gpu_model_runner.py"):
+            text = _decorate_gpu_method(text, "execute_model", _GPU_DECORATOR)
+            input_method = next(
+                (
+                    method_name
+                    for method_name in (
+                        "_prepare_inputs",
+                        "_prepare_model_inputs",
+                        "_prepare_input_tensors",
+                        "prepare_inputs",
+                    )
+                    if _method_pattern(method_name).search(text)
+                ),
+                None,
+            )
+            if input_method is not None:
+                text = _decorate_gpu_method(
+                    text,
+                    input_method,
+                    _GPU_INPUT_DECORATOR,
+                )
         matched_any = False
         for method in file_target.methods:
             _, matches = _matching_method(text, method)

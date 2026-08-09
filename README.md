@@ -312,6 +312,55 @@ Set `VLLM_BW_PROFILE_SCHEDULER=1` to time `Scheduler.schedule()` and the custom 
 operations. `scheduler_timings.csv` and `scheduler_timing_summary.csv` contain the trial-level
 and aggregated timings; `VLLM_BW_PROFILE_INTERVAL` controls the cumulative log interval.
 
+### Detailed EngineCore step and GPU model timing
+
+Install the vLLM 0.22.1 instrumentation once after syncing it to the GPU host:
+
+```bash
+scripts/vllm_bw.sh install-timing --remote \
+  --host hinton-01 --remote-dir ~/code/attention-bw
+```
+
+The `overhead` profile records exclusive regions in both `EngineCore.step` implementations:
+request checks, scheduling, model submission, grammar masks, future waits, sampling, queue
+operations, abort handling, and output updates. It writes a reconciled CSV whose rows sum to the
+complete step; `unmeasured_python_between_regions` is the measured residual for branches,
+context-manager entry/exit, and return bookkeeping.
+
+```bash
+scripts/vllm_bw.sh profile overhead --remote --detach \
+  --host hinton-01 --remote-dir ~/code/attention-bw \
+  --out results/vllm_step_breakdown_sync -- \
+  --model llama-3.1-8b --scheduling-mode sync \
+  --max-model-len 10240 --random-prefix-len 10000 --random-input-len 20 \
+  --random-output-len 50 --num-prompts 300 --max-num-seqs 100 \
+  --max-concurrency 100 --request-rate inf
+```
+
+Repeat with `--scheduling-mode async` and a distinct output prefix. `<out>_timing.csv` is the
+exclusive reconciled step budget (including zero-call branches), while `<out>_timing_raw.csv`
+retains every cumulative function timer such as model execution and input preparation.
+
+The `model-gpu` profile runs the same serving workload under Nsight Systems. Instrumentation adds
+nested NVTX ranges around `GPUModelRunner.execute_model` and its input-preparation method. NSYS's
+GPU-projection report therefore gives GPU duration for the whole execution range and for input
+preparation; subtracting the latter confirms the report's "execute model, excluding preparation"
+measurement. A CUDA-kernel summary is emitted as a separate cross-check.
+
+```bash
+scripts/vllm_bw.sh profile model-gpu --remote --detach \
+  --host hinton-01 --remote-dir ~/code/attention-bw \
+  --out results/vllm_model_gpu_sync -- \
+  --model llama-3.1-8b --scheduling-mode sync \
+  --max-model-len 10240 --random-prefix-len 10000 --random-input-len 20 \
+  --random-output-len 50 --num-prompts 300 --max-num-seqs 100 \
+  --max-concurrency 100 --request-rate inf
+```
+
+Fetch either detached run with `scripts/vllm_bw.sh fetch ...`. The GPU run returns
+`<out>_model_gpu.csv` (NVTX GPU projections) and `<out>_kernel_summary.csv`; raw `.nsys-rep` and
+SQLite files remain on the remote host.
+
 Interpretation: if DRAM p95 is close to sustained peak while SM activity is materially lower,
 decode is behaving as memory-bound and remaining gains likely need better memory locality,
 batching, KV-cache layout, or quantization. If DRAM p95 is far below peak during the measured

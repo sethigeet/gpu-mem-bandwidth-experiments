@@ -5,9 +5,9 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_remote_lib.sh"
 
 COMMAND=${1:-}
 case "$COMMAND" in
-  profile|compare|fetch|install|install-policies) ;;
+  profile|compare|fetch|install|install-policies|install-timing) ;;
   *)
-    echo "Usage: $0 {profile|compare|fetch|install|install-policies} [serve|client] [--remote] [--detach] [--host HOST] [--remote-dir DIR] [--out PREFIX] -- [vLLM args]" >&2
+    echo "Usage: $0 {profile|compare|fetch|install|install-policies|install-timing} [serve|client|overhead|model-gpu] [--remote] [--detach] [--host HOST] [--remote-dir DIR] [--out PREFIX] -- [vLLM args]" >&2
     exit 2
     ;;
 esac
@@ -16,8 +16,8 @@ shift
 PROFILE_SCOPE=
 if [[ "$COMMAND" == "profile" ]]; then
   PROFILE_SCOPE=${1:-}
-  [[ "$PROFILE_SCOPE" == "serve" || "$PROFILE_SCOPE" == "client" ]] || {
-    echo "profile requires a scope: serve or client" >&2
+  [[ "$PROFILE_SCOPE" == "serve" || "$PROFILE_SCOPE" == "client" || "$PROFILE_SCOPE" == "overhead" || "$PROFILE_SCOPE" == "model-gpu" ]] || {
+    echo "profile requires a scope: serve, client, overhead, or model-gpu" >&2
     exit 2
   }
   shift
@@ -25,6 +25,23 @@ fi
 parse_common_args "$@"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+if [[ "$COMMAND" == "install-timing" ]]; then
+  [[ "$COMMON_REMOTE" == true ]] || {
+    echo "The instrumented vLLM installation is GPU-host-only; use install-timing --remote" >&2
+    exit 2
+  }
+  sync_project "$COMMON_HOST" "$COMMON_REMOTE_DIR"
+  REMOTE_DIR_ABS=$(resolve_remote_dir "$COMMON_HOST" "$COMMON_REMOTE_DIR")
+  TIMING_ARGS=(python3 -m vllm_bw.timing_fork)
+  if ((${#COMMON_EXTRA[@]})); then
+    TIMING_ARGS+=("${COMMON_EXTRA[@]}")
+  else
+    TIMING_ARGS+=(--venv-python .venv/bin/python)
+  fi
+  run_remote "$COMMON_HOST" "$REMOTE_DIR_ABS" "${TIMING_ARGS[@]}"
+  exit 0
+fi
+
 if [[ "$COMMAND" == "install-policies" ]]; then
   [[ "$COMMON_REMOTE" == true ]] || {
     echo "The policy-enabled vLLM fork is GPU-host-only; use install-policies --remote" >&2
@@ -84,6 +101,18 @@ if [[ "$COMMAND" == "fetch" ]]; then
       "$COMMON_HOST:$REMOTE_DIR_ABS/$OUT/" "$OUT/"
     copy_remote_file "$COMMON_HOST" "$REMOTE_DIR_ABS" "${OUT}.remote.log"
     echo "Copied scheduling comparison results to $OUT (raw NSYS files remain remote)"
+  elif ssh "$COMMON_HOST" "test -f $(printf '%q' "$REMOTE_DIR_ABS/${OUT}_timing.csv")"; then
+    copy_remote_file "$COMMON_HOST" "$REMOTE_DIR_ABS" "${OUT}_timing.csv"
+    copy_remote_file "$COMMON_HOST" "$REMOTE_DIR_ABS" "${OUT}_timing_raw.csv"
+    copy_remote_file "$COMMON_HOST" "$REMOTE_DIR_ABS" "${OUT}.remote.log"
+    copy_remote_dir "$COMMON_HOST" "$REMOTE_DIR_ABS" "${OUT}_logs"
+    echo "Copied detailed CPU overhead artifacts for $OUT"
+  elif ssh "$COMMON_HOST" "test -f $(printf '%q' "$REMOTE_DIR_ABS/${OUT}_model_gpu.csv")"; then
+    copy_remote_file "$COMMON_HOST" "$REMOTE_DIR_ABS" "${OUT}_model_gpu.csv"
+    copy_remote_file "$COMMON_HOST" "$REMOTE_DIR_ABS" "${OUT}_kernel_summary.csv"
+    copy_remote_file "$COMMON_HOST" "$REMOTE_DIR_ABS" "${OUT}.remote.log"
+    copy_remote_dir "$COMMON_HOST" "$REMOTE_DIR_ABS" "${OUT}_logs"
+    echo "Copied model GPU timing artifacts for $OUT (raw NSYS files remain remote)"
   else
     copy_remote_file "$COMMON_HOST" "$REMOTE_DIR_ABS" "${OUT}.png"
     copy_remote_file "$COMMON_HOST" "$REMOTE_DIR_ABS" "${OUT}_summary.csv"
@@ -100,6 +129,7 @@ if [[ "$COMMON_REMOTE" == true ]]; then
   REMOTE_ENV=(env)
   for variable in \
     VLLM_ATTENTION_BACKEND \
+    VLLM_BW_PROFILE_GPU \
     VLLM_BW_PROFILE_INTERVAL \
     VLLM_BW_PROFILE_SCHEDULER \
     HF_HUB_OFFLINE \
@@ -167,6 +197,26 @@ if [[ "$COMMAND" == "compare" ]]; then
 elif [[ "$PROFILE_SCOPE" == "client" ]]; then
   uv run vllm_main.py client-nsys \
     --output-prefix "$OUT" --log-dir "${OUT}_logs" "${COMMON_EXTRA[@]}"
+elif [[ "$PROFILE_SCOPE" == "overhead" ]]; then
+  export VLLM_BW_PROFILE_SCHEDULER=1
+  uv run vllm_main.py serve --log-dir "${OUT}_logs" "${COMMON_EXTRA[@]}"
+  uv run vllm_main.py timing-summary \
+    --log "${OUT}_logs/server.log" --output "${OUT}_timing.csv" \
+    --raw-output "${OUT}_timing_raw.csv"
+elif [[ "$PROFILE_SCOPE" == "model-gpu" ]]; then
+  export VLLM_BW_PROFILE_GPU=1
+  nsys profile \
+    --trace="${NSYS_TRACE:-cuda,nvtx}" \
+    --duration=0 --output="$OUT" --force-overwrite=true \
+    uv run vllm_main.py serve --log-dir "${OUT}_logs" "${COMMON_EXTRA[@]}"
+  nsys export --type=sqlite --force-overwrite=true \
+    --output="${OUT}.sqlite" "${OUT}.nsys-rep"
+  nsys stats --report nvtx_gpu_proj_sum --format=csv --force-export=true \
+    "${OUT}.nsys-rep" \
+    > "${OUT}_model_gpu.csv"
+  nsys stats --report cuda_gpu_kern_sum --format=csv --force-export=true \
+    "${OUT}.nsys-rep" \
+    > "${OUT}_kernel_summary.csv"
 else
   nsys profile \
     --trace="${NSYS_TRACE:-cuda,nvtx}" \

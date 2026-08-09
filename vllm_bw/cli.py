@@ -4,6 +4,8 @@ import argparse
 import sys
 from pathlib import Path
 
+from vllm_bw.overhead_analysis import write_reconciled_step_csv
+from vllm_bw.overhead_report import generate_overhead_report, write_gpu_event_csv
 from vllm_bw.scheduling_compare import (
     add_scheduling_compare_args,
     run_scheduling_comparison,
@@ -56,6 +58,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use the full trace instead of filtering to the measured NVTX range",
     )
 
+    timing_summary = subparsers.add_parser(
+        "timing-summary",
+        help="Reconcile detailed EngineCore phase timings from a vLLM server log",
+    )
+    timing_summary.add_argument("--log", type=Path, required=True)
+    timing_summary.add_argument("--output", "-o", type=Path, required=True)
+    timing_summary.add_argument("--raw-output", type=Path)
+
+    overhead_report = subparsers.add_parser(
+        "overhead-report",
+        help="Generate combined CPU/GPU overhead plots and analysis",
+    )
+    overhead_report.add_argument("--input-dir", type=Path, required=True)
+
+    gpu_events = subparsers.add_parser(
+        "gpu-event-summary",
+        help="Extract cumulative CUDA-event timings from a server log",
+    )
+    gpu_events.add_argument("--log", type=Path, required=True)
+    gpu_events.add_argument("--output", type=Path, required=True)
+
     return parser
 
 
@@ -86,6 +109,18 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         rows = summarize_nsys(args.input, measured_only=not args.full_trace)
         write_summary_csv(rows, args.output)
+        return 0
+    if args.command == "timing-summary":
+        write_reconciled_step_csv(args.log, args.output, args.raw_output)
+        print(f"Wrote {args.output}")
+        return 0
+    if args.command == "overhead-report":
+        generate_overhead_report(args.input_dir)
+        print(f"Wrote analysis and plots under {args.input_dir}")
+        return 0
+    if args.command == "gpu-event-summary":
+        write_gpu_event_csv(args.log, args.output)
+        print(f"Wrote {args.output}")
         return 0
 
     parser.print_help()
