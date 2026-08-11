@@ -187,16 +187,23 @@ def merge_throughput_and_ncu(throughput_csv: Path, ncu_summary: pd.DataFrame) ->
 def plot_report(merged: pd.DataFrame, type_summary: pd.DataFrame, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     if merged["batch_size"].nunique() > 1:
-        fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+        has_sm = "ncu_sm_pct_weighted" in merged and merged["ncu_sm_pct_weighted"].fillna(0).gt(0).any()
+        panel_count = 3 if has_sm else 2
+        fig, axes = plt.subplots(1, panel_count, figsize=(7.5 * panel_count, 6))
         for stage, sdf in merged.groupby("stage", sort=False):
             sdf = sdf.sort_values("batch_size")
             axes[0].plot(sdf["batch_size"], sdf["throughput_toks_s"], marker="o", label=stage)
             axes[1].plot(sdf["batch_size"], sdf["ncu_dram_pct_weighted"], marker="o", label=stage)
+            if has_sm:
+                axes[2].plot(sdf["batch_size"], sdf["ncu_sm_pct_weighted"], marker="o", label=stage)
         axes[0].set_title("Decode Throughput vs Batch Size")
         axes[0].set_ylabel("tokens/s")
         axes[0].set_yscale("log")
         axes[1].set_title("DRAM Bandwidth Utilization vs Batch Size")
         axes[1].set_ylabel("% of peak sustained")
+        if has_sm:
+            axes[2].set_title("SM Utilization vs Batch Size")
+            axes[2].set_ylabel("% of peak sustained")
         for axis in axes:
             axis.set_xlabel("batch size")
             axis.set_xscale("log", base=2)
@@ -204,7 +211,7 @@ def plot_report(merged: pd.DataFrame, type_summary: pd.DataFrame, output: Path) 
             axis.get_xaxis().set_major_formatter(plt.ScalarFormatter())
             axis.tick_params(axis="x", rotation=45)
             axis.grid(alpha=0.25)
-        axes[1].legend(fontsize=8, ncol=2)
+        axes[-1].legend(fontsize=8, ncol=2)
         fig.suptitle("Phi-3-mini-shaped 10K Shared-prefix Component Batch Sweep", fontsize=12)
         plt.tight_layout()
         plt.savefig(output, dpi=150)
@@ -302,9 +309,14 @@ def write_report(
         if is_batch_sweep
         else "Component Bandwidth 10K Shared-prefix Report"
     )
+    has_sm = "ncu_sm_pct_weighted" in merged and merged["ncu_sm_pct_weighted"].fillna(0).gt(0).any()
+    sweep_counters = ["`dram__throughput.avg.pct_of_peak_sustained_elapsed`"]
+    if has_sm:
+        sweep_counters.append("`sm__throughput.avg.pct_of_peak_sustained_elapsed`")
+    sweep_counters.append("`gpu__time_duration.sum`")
     counter_note = (
-        "- Counters: `dram__throughput.avg.pct_of_peak_sustained_elapsed` and `gpu__time_duration.sum`.\n"
-        "- Aggregation: DRAM utilization is a kernel-duration-weighted average for the measured decode token."
+        f"- Counters: {', '.join(sweep_counters)}.\n"
+        "- Aggregation: DRAM/SM utilization is a kernel-duration-weighted average for the measured decode token."
         if is_batch_sweep
         else "- Counters: `dram__bytes_read.sum`, `dram__bytes_write.sum`, `dram__throughput.avg.pct_of_peak_sustained_elapsed`, `sm__throughput.avg.pct_of_peak_sustained_elapsed`, and `gpu__time_duration.sum`.\n"
         "- Aggregation: effective GB/s is total read+write bytes divided by total profiled kernel duration. DRAM/SM percentages are duration-weighted averages across kernels in each stage."
@@ -313,7 +325,7 @@ def write_report(
     if not is_batch_sweep:
         stage_columns.append("ncu_bandwidth_gb_s")
     stage_columns.extend(["ncu_dram_pct_weighted"])
-    if not is_batch_sweep:
+    if has_sm:
         stage_columns.append("ncu_sm_pct_weighted")
     stage_columns.append("kernel_count")
     type_columns = [
@@ -326,7 +338,7 @@ def write_report(
     if not is_batch_sweep:
         type_columns.append("ncu_bandwidth_gb_s")
     type_columns.append("ncu_dram_pct_weighted")
-    if not is_batch_sweep:
+    if has_sm:
         type_columns.append("ncu_sm_pct_weighted")
 
     report = f"""# {title}
@@ -369,9 +381,32 @@ def ncu_type_summary_path(report_path: Path) -> Path:
     return report_path.with_name(f"{report_path.stem}_ncu_kernel_types.csv")
 
 
-def generate_report(throughput_csv: Path, ncu_pattern: str, output: Path, plot_output: Path | None = None) -> None:
+def _merge_sm_summary(primary: pd.DataFrame, sm: pd.DataFrame) -> pd.DataFrame:
+    if sm.empty:
+        return primary
+    keys = ["stage", *(["batch_size"] if "batch_size" in sm else [])]
+    if "kernel_type" in primary and "kernel_type" in sm:
+        keys.append("kernel_type")
+    metrics = [column for column in ["ncu_sm_pct_weighted", "ncu_sm_pct_max"] if column in sm]
+    sm_columns = [*keys, *metrics]
+    base = primary.drop(columns=metrics, errors="ignore")
+    return base.merge(sm[sm_columns], on=keys, how="left")
+
+
+def generate_report(
+    throughput_csv: Path,
+    ncu_pattern: str,
+    output: Path,
+    plot_output: Path | None = None,
+    sm_ncu_pattern: str | None = None,
+) -> None:
     kernels = load_ncu_glob(ncu_pattern)
     ncu_summary, type_summary = summarize_ncu(kernels)
+    if sm_ncu_pattern:
+        sm_kernels = load_ncu_glob(sm_ncu_pattern)
+        sm_summary, sm_type_summary = summarize_ncu(sm_kernels)
+        ncu_summary = _merge_sm_summary(ncu_summary, sm_summary)
+        type_summary = _merge_sm_summary(type_summary, sm_type_summary)
     merged = merge_throughput_and_ncu(throughput_csv, ncu_summary)
 
     summary_path = ncu_summary_path(output)

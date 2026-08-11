@@ -29,7 +29,11 @@ fi
 if [[ "$COMMON_REMOTE" == true ]]; then
   sync_project "$COMMON_HOST" "$COMMON_REMOTE_DIR"
   REMOTE_DIR_ABS=$(resolve_remote_dir "$COMMON_HOST" "$COMMON_REMOTE_DIR")
-  REMOTE_ARGS=(./scripts/component_bw.sh "$COMMAND" --out "$OUT" -- "${COMMON_EXTRA[@]}")
+  REMOTE_ARGS=(env)
+  for variable in NCU_METRICS NCU_REPLAY_MODE COMPONENT_BATCH_SIZES; do
+    [[ ! -v "$variable" ]] || REMOTE_ARGS+=("${variable}=${!variable}")
+  done
+  REMOTE_ARGS+=(./scripts/component_bw.sh "$COMMAND" --out "$OUT" -- "${COMMON_EXTRA[@]}")
   if [[ "$COMMON_DETACH" == true ]]; then
     SESSION=${TMUX_SESSION:-component_bw_${COMMAND}_${TIMESTAMP}}
     start_remote_tmux \

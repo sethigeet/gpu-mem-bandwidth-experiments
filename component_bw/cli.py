@@ -4,7 +4,6 @@ import argparse
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
 
 from component_bw.config import LAYOUTS, MODEL_PRESETS, STAGES, StageName, SyntheticConfig, with_model_preset
 from component_bw.runner import result_to_row, run_stage, write_config, write_rows
@@ -22,7 +21,7 @@ def _batch_size(text: str) -> int | None:
 def _stage_list(values: list[str]) -> list[StageName]:
     if "all" in values:
         return list(STAGES)
-    return cast(list[StageName], [stage for stage in values if stage in STAGES])
+    return [stage for stage in values if stage in STAGES]
 
 
 def _add_config_args(parser: argparse.ArgumentParser) -> None:
@@ -139,6 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser = sub.add_parser("report", help="Generate a Markdown report from throughput and NCU CSVs")
     report_parser.add_argument("--throughput-csv", type=Path, required=True)
     report_parser.add_argument("--ncu-glob", required=True)
+    report_parser.add_argument("--sm-ncu-glob", help="Optional NCU CSV glob containing SM utilization counters")
     report_parser.add_argument("--output", "-o", type=Path, required=True)
     report_parser.add_argument("--plot-output", type=Path)
 
@@ -235,7 +235,7 @@ def run_report(args: argparse.Namespace) -> int:
     if not args.throughput_csv.exists():
         print(f"Error: {args.throughput_csv} not found", file=sys.stderr)
         return 1
-    generate_report(args.throughput_csv, args.ncu_glob, args.output, args.plot_output)
+    generate_report(args.throughput_csv, args.ncu_glob, args.output, args.plot_output, args.sm_ncu_glob)
     return 0
 
 
