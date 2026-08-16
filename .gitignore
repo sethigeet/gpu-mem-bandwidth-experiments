@@ -41,3 +41,8 @@ cython_debug/
 
 # Application data
 results/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/

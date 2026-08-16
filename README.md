@@ -1,355 +1,213 @@
-# GPU Memory Bandwidth Benchmarks
+# GPU Memory Benchmarks for LLM Inference
 
-This project measures the memory-bandwidth behavior of LLM **decode-step** (single-token
-generation) workloads on an NVIDIA GPU, using NVIDIA's profilers — Nsight Compute (`ncu`)
-for per-kernel hardware counters and Nsight Systems (`nsys`) for whole-run GPU-metric
-timelines.
+This repository measures how LLM inference workloads use NVIDIA GPU memory bandwidth. It covers
+isolated attention kernels, full-model decode, a staged synthetic model, prefix-cache locality,
+and vLLM serving under request load.
 
-There are two benchmark suites:
+The benchmark code is organized under one package and exposed through one command:
 
-- **`attention_bw`** — isolated scaled-dot-product-attention (SDPA) kernels for a single
-  decode step (one query token attending over a KV cache). Use this to compare attention
-  backends in isolation.
-- **`llm_bw`** — a full Hugging Face transformer model running the decode phase end to end.
-  Use this to see where time and bandwidth go across the whole model (attention, linear
-  layers, norms, etc.).
-- **`prefix_bw`** — reproduces the prefix-homogeneity claims of the _Feather_ paper
-  ("Requests of a Feather Must Flock Together", `Cache_aware_LLM_batching.pdf`) on vLLM with
-  prefix caching. Builds batches of requests that physically share KV-cache prefixes and
-  measures how decode throughput and DRAM bandwidth change with homogeneity, shared-prefix
-  length, number of prefix groups, and batch size.
-- **`vllm_bw`** — profiles a standard `vllm serve` OpenAI-compatible server while
-  `vllm bench serve` sends many requests. Use this to answer whether a realistic serving run is
-  saturating DRAM during decode-heavy request load or leaving memory-bandwidth headroom.
+| Suite | Purpose |
+| --- | --- |
+| `attention` | Compare scaled-dot-product attention backends for one decode step. |
+| `model` | Profile token-by-token decode in a Hugging Face causal language model. |
+| `components` | Isolate the cost of attention, MLPs, decoder blocks, full models, and paged KV access. |
+| `prefix-cache` | Reproduce prefix-homogeneity and locality experiments with vLLM. |
+| `vllm` | Measure serving throughput, GPU utilization, scheduling policies, and EngineCore overhead. |
 
-The local machine is assumed to have **no GPU**. Everything that needs CUDA runs on a remote
-host over SSH; each suite script's `--remote` mode syncs the repo, runs the profiler remotely,
-renders the plot remotely, and copies the requested artifacts back. Locally you only need
-CPU/tooling dependencies.
+Checked-in Markdown files under [`docs/`](docs/) are curated studies. Analysis code writes raw
+CSV tables and figures; it does not generate or overwrite narrative reports.
 
-## Requirements
+## Environment
 
-- **Local:** Python managed with [`uv`](https://docs.astral.sh/uv/), plus SSH/rsync access to
-  the GPU host. Dependencies are in `requirements.txt` (numpy, pandas, matplotlib, transformers,
-  accelerate, sentencepiece; `ruff`/`ty` for tooling). PyTorch is intentionally **not** installed
-  locally.
-- **Remote GPU host:** CUDA-capable GPU with a matching PyTorch build, `transformers`, and the
-  NVIDIA profilers (`ncu` and/or `nsys`) on `PATH`. `flash_attention_2` / `flash_attention_3`
-  require the corresponding packages installed on the remote.
-
-Format, lint, and type-check with:
+Python environments are managed with [uv](https://docs.astral.sh/uv/). The local development
+machine does not need CUDA or PyTorch:
 
 ```bash
-uvx ruff format .
+uv sync --group dev
+uv run gpu-memory-benchmarks --help
+uvx ruff format --check .
 uvx ruff check .
 uvx ty check
 ```
 
-## Remote configuration
-
-The suite scripts accept the same remote options: `--remote`, `--host`, and `--remote-dir`.
-Benchmark-specific arguments follow `--`. Each remote profiling run syncs the repository first.
+On a CUDA GPU host, install the model dependencies needed by the attention, model, and component
+suites:
 
 ```bash
-scripts/remote.sh sync --host my-gpu-host --remote-dir ~/work
+uv sync --extra model
 ```
 
-## attention_bw — SDPA kernel benchmark
-
-Compares attention backends for a single decode step. Shapes are `B,H,CACHE_SEQ,D`: the query
-is a single token `(B,H,1,D)`, the K/V cache is `(B,H,CACHE_SEQ,D)`.
-
-Kernels: `sdpa_math`, `sdpa_mem_efficient`, `sdpa_flash` (or `all`).
-
-Run remotely with the suite wrapper (output filename is timestamped automatically):
+The serving scripts can install the pinned vLLM version remotely, or it can be installed with:
 
 ```bash
-# Nsight Compute (per-kernel DRAM/SM counters)
-scripts/attention_bw.sh ncu --remote --host hinton-01 -- \
+uv sync --extra model --extra serving
+```
+
+Nsight Compute (`ncu`) and Nsight Systems (`nsys`) must be available on the GPU host. Some
+attention implementations also require their corresponding optional packages.
+
+## Remote execution
+
+Every GPU-facing wrapper accepts `--remote`, `--host`, and `--remote-dir`. The wrapper synchronizes
+the project, runs the benchmark and visualization remotely, then copies the requested artifacts
+back. Set defaults once if preferred:
+
+```bash
+export REMOTE_HOST=gpu-host
+export REMOTE_DIR=~/gpu-memory-benchmarks
+scripts/remote.sh sync
+```
+
+Long component and vLLM jobs support `--detach`; they run in remote tmux and print the session,
+log, output prefix, and fetch command.
+
+## Attention and full-model decode
+
+The shared profiling wrapper removes duplicated Nsight setup between the two suites:
+
+```bash
+# Isolated SDPA kernels under Nsight Compute.
+scripts/profile.sh attention ncu --remote -- \
   --kernels all --shape 2,64,4096,128 --dtype fp16
 
-# Nsight Systems (GPU-metric timeline)
-scripts/attention_bw.sh nsys --remote --host hinton-01 -- \
-  --kernels sdpa_flash --shape 1,16,4096,64
+# One model's decode phase under Nsight Systems.
+scripts/profile.sh model nsys --remote -- \
+  --model mistral-7b --attention flash_attention_2 \
+  --prompt-length 512 --batch-size 1
 ```
 
-Both scripts render the plot on the remote and copy a `.png` into `results/`.
+Attention shapes use `B,H,CACHE_SEQ,D`. Full-model aliases include `llama-7b`, `llama-13b`,
+`llama-3-8b`, `llama-3.1-8b`, `mistral-7b`, and `phi-3-mini`; a full Hugging Face model ID is
+also accepted. NCU profiles only one measured model token because counter replay is expensive.
 
-## llm_bw — full-model decode benchmark
+Measured NVTX ranges use `gpu_memory:attention:...` and `gpu_memory:model:...`.
 
-Runs a Hugging Face model: one prefill pass over the prompt, then token-by-token decode. The
-attention implementation is selectable.
+## Synthetic decode components
 
-- Models (`--model`): `llama-7b`, `llama-13b`, `mistral-7b`, `phi-3-mini` (default `phi-3-mini`).
-- Attention (`--attention`): `eager`, `sdpa` (default), `flash_attention_2`, `flash_attention_3`,
-  `flex_attention`, and the `paged|*` variants.
-- Key knobs: `--dtype`, `--prompt-length`, `--decode-tokens`, `--warmup-tokens`, `--batch-size`.
+The component ladder separates increasingly complete decode paths:
+
+- `attention_kernel`: direct SDPA over a preallocated KV cache.
+- `attention_layer`: QKV/output projections plus SDPA.
+- `mlp`: gated feed-forward network only.
+- `block`: one normalized attention/MLP decoder block with residuals.
+- `decoder_stack`: all decoder blocks.
+- `full_model`: embeddings, decoder stack, final norm, LM head, and sampling.
+- `paged_attention`: attention with a PyTorch block-table KV gather.
+- `paged_full_model`: the full synthetic model with the same paged-KV approximation.
+
+KV layouts are `replicated`, `shared`, and `paged`. Start with a smoke run:
 
 ```bash
-# Nsight Compute (per-layer-type breakdown)
-scripts/llm_bw.sh ncu --remote --host hinton-01 -- \
-  --model phi-3-mini --attention sdpa --prompt-length 512
-
-# Nsight Systems (timeline over the decode phase)
-scripts/llm_bw.sh nsys --remote --host hinton-01 -- \
-  --model mistral-7b --attention flash_attention_2
+scripts/components.sh nsys --remote -- \
+  --smoke --stages attention_kernel attention_layer mlp block paged_attention
 ```
 
-> NCU runs every kernel multiple times to collect counters, so it is slow. The LLM NCU wrapper
-> caps decode to 1 token; keep token counts small when profiling with `ncu`.
-
-## component_bw — staged synthetic decode ladder
-
-Builds the missing pieces between isolated attention and vLLM with PyTorch modules shaped like
-Phi-3-mini by default. Each stage runs the same long shared-prefix decode shape and reports
-decode throughput plus estimated KV bytes and launch count. Nsight ranges use
-`component_bw:<stage>:case|warmup|iter`.
-
-Stages:
-
-- `attention_kernel` — direct SDPA decode over preallocated KV.
-- `attention_layer` — QKV/O projections plus SDPA.
-- `mlp` — gated MLP only.
-- `block` — RMSNorm, attention, residuals, and MLP for one decoder block.
-- `blocks` — repeated decoder blocks.
-- `model` — embeddings, all blocks, final norm, lm head, and argmax sampling.
-- `paged_attention` — attention layer with a PyTorch block-table KV gather.
-- `paged_model` — full synthetic model with the same paged-KV approximation.
-
-Run a small remote smoke test first:
+Run a large throughput and NCU batch sweep in detached tmux:
 
 ```bash
-scripts/component_bw.sh nsys --remote --host hinton-01 --remote-dir ~/code/attention-bw -- \
-  --smoke \
-  --stages attention_kernel attention_layer mlp block paged_attention
-```
-
-Run the canonical 10K shared-prefix matrix:
-
-```bash
-scripts/component_bw.sh bundle --remote --detach \
-  --host hinton-01 --remote-dir ~/code/attention-bw -- \
-  --model phi-3-mini \
-  --prefix-len 10000 \
-  --decode-tokens 64 \
-  --batch-size auto \
-  --max-auto-batch 256 \
-  --layout shared
-```
-
-The tmux launcher prints a `scripts/component_bw.sh fetch ...` command to copy artifacts back
-after the detached session finishes.
-
-Profile one stage with Nsight Compute counters:
-
-```bash
-scripts/component_bw.sh ncu --remote \
-  --host hinton-01 --remote-dir ~/code/attention-bw -- \
-  --stage attention_kernel \
-  --prefix-len 10000 \
-  --batch-size auto \
-  --layout shared
-```
-
-The NSYS wrapper writes `results/component_bw_nsys_<ts>.csv` for throughput,
-`_summary.png` for the stage waterfall, `.png` for DRAM/SM timelines, and
-`_nsys_summary.csv` with average/p50/p95/max utilization inside the measured component ranges.
-
-Sweep every component through batch 1024 and collect matching NCU counters. Memory-heavy paged
-stages are skipped after their largest feasible batch instead of aborting the sweep:
-
-```bash
-scripts/component_bw.sh sweep-bundle --remote --detach \
-  --host hinton-01 --remote-dir ~/code/attention-bw \
-  --out results/component_bw_10k_batch_sweep -- \
+scripts/components.sh sweep-bundle --remote --detach \
+  --out results/components_10k_batch_sweep -- \
   --model phi-3-mini --prefix-len 10000 --decode-tokens 64 --layout shared \
   --batch-sizes 1 2 4 8 16 32 40 48 64 128 256 512 1024
 ```
 
-The sweep uses NCU application replay by default so full-model stages do not pay per-kernel replay
-overhead. Override `COMPONENT_BATCH_SIZES` only if the NCU batch list must differ from the throughput
-list.
+The NCU sweep uses kernel replay by default and checkpoints every stage/batch pair with `.done`
+or `.skipped`. Infeasible paged points do not abort the dense-stage sweep. Override the NCU batch
+list with `COMPONENT_BATCH_SIZES` when needed.
 
-## prefix_bw — Feather prefix-homogeneity reproduction
-
-Reproduces the paper's claim that, because decode is memory-bandwidth bound, batches whose
-requests **physically share a KV-cache prefix** get better spatial/temporal locality (higher
-effective DRAM bandwidth, fewer bytes fetched) and so higher decode throughput. Requests are
-built as raw token-id lists; identical leading tokens make vLLM's prefix cache store the shared
-prefix once and let every request in the group read the same KV blocks.
-
-Each subcommand sweeps one knob and writes a throughput CSV + plot. The `EXPERIMENT` is one of
-`homogeneity` (Fig 4), `prefix-length` (Fig 5), `num-groups` (Fig 6), `batch-size` (Figs 8–9):
+Combine a throughput CSV and per-stage NCU files into data and a figure:
 
 ```bash
-# Fig 4: vary the fraction of requests on a shared prefix (homogeneous beta=0/1 vs mixed)
-scripts/prefix_bw.sh sweep homogeneity --remote -- --model llama-7b --num-requests 256
+uv run gpu-memory-benchmarks components analyze \
+  --throughput-csv results/components_10k_batch_sweep_throughput.csv \
+  --ncu-glob 'results/components_10k_batch_sweep_ncu_b*_*.csv' \
+  --output-prefix results/components_10k_analysis
+```
 
-# Fig 5: vary the shared prefix length
-scripts/prefix_bw.sh sweep prefix-length --remote -- --total-len 4096
+This writes `components_10k_analysis_stage_summary.csv`,
+`components_10k_analysis_kernel_types.csv`, and `components_10k_analysis.png`.
 
-# Fig 6: vary the number of distinct prefix groups
-scripts/prefix_bw.sh sweep num-groups --remote -- --values 1,2,4,8,16,32
+## Prefix-cache locality
 
-# Figs 8-9: sweep batch size for homogeneous vs heterogeneous workloads (two lines)
-scripts/prefix_bw.sh sweep batch-size --remote -- \
+These experiments construct raw token sequences whose leading tokens are physically shared by
+vLLM's prefix cache. Each command writes a throughput CSV and plot:
+
+```bash
+scripts/prefix-cache.sh sweep homogeneity --remote -- \
+  --model llama-7b --num-requests 256
+
+scripts/prefix-cache.sh sweep prefix-length --remote -- --total-len 4096
+scripts/prefix-cache.sh sweep num-groups --remote -- --values 1,2,4,8,16,32
+scripts/prefix-cache.sh sweep batch-size --remote -- \
   --values 16,32,64,128,256 --hetero-groups 5
 ```
 
-To verify the **bandwidth** claim directly (not just throughput), profile a single config under
-nsys and render the DRAM-bandwidth timeline (reusing the `llm_bw` nsys visualizer). Pass one
-sweep value so the timeline is clean — e.g. fully homogeneous vs mixed:
+Use the `nsys` command with one sweep value to inspect bandwidth directly:
 
 ```bash
-scripts/prefix_bw.sh nsys homogeneity --remote -- --values 1.0  # homogeneous: high BW
-scripts/prefix_bw.sh nsys homogeneity --remote -- --values 0.5  # mixed: lower BW
+scripts/prefix-cache.sh nsys homogeneity --remote -- --values 1.0
+scripts/prefix-cache.sh nsys homogeneity --remote -- --values 0.5
 ```
 
-Common knobs (all subcommands): `--model` (registry key or raw HF id), `--dtype`,
-`--num-requests`, `--decode-tokens`, `--max-num-seqs` (vLLM batch size),
-`--gpu-memory-utilization`, `--values` (the sweep points), `--no-warmup`. The measured
-`generate` is wrapped in `prefix_bw:...:case` NVTX ranges (with `...:warmup` around prefix-cache
-warmup) so the nsys visualizer isolates decode, exactly like `llm_bw`. Defaults are scaled down
-from the paper (which used Llama-3-8B with 10K-token prefixes); raise `--prefix-len` /
-`--total-len` / `--num-requests` toward those to match it more closely.
+Measured ranges use `gpu_memory:prefix_cache:...`.
 
-## vllm_bw — vLLM serving under request load
+## vLLM serving and scheduling
 
-Runs `vllm serve` under Nsight Systems, waits for `/health`, warms the server with a small
-`vllm bench serve` run, then wraps the measured benchmark in an NVTX range named
-`vllm_bw:serve:bench`. The visualizer filters the exported SQLite to that range so startup,
-model load, and warmup do not dilute the DRAM-bandwidth numbers.
+Profile a server while `vllm bench serve` supplies request load:
 
 ```bash
-# Start a standard serving profile on the remote GPU host in detached tmux.
-scripts/vllm_bw.sh profile serve --remote --detach \
-  --host hinton-01 --remote-dir ~/code/attention-bw -- \
+scripts/vllm-server.sh profile serve --remote --detach -- \
   --model phi-3-mini \
-  --random-input-len 2048 \
-  --random-output-len 64 \
-  --num-prompts 256 \
-  --max-num-seqs 256 \
-  --request-rate inf
-
-# The start command prints the output prefix. Fetch artifacts after tmux finishes.
-scripts/vllm_bw.sh fetch --host hinton-01 --remote-dir ~/code/attention-bw \
-  --out results/vllm_bw_serve_nsys_<ts>
+  --random-input-len 2048 --random-output-len 64 \
+  --num-prompts 256 --max-num-seqs 256 --request-rate inf
 ```
 
-The wrapper writes:
-
-- `results/vllm_bw_serve_nsys_<ts>.png` — DRAM and SM utilization timelines for the measured
-  request-load window.
-- `results/vllm_bw_serve_nsys_<ts>_summary.csv` — per-metric average, p50, p95, max, and
-  `headroom_vs_p95_pct`.
-- `results/vllm_bw_serve_nsys_<ts>_logs/bench.log` — `vllm bench serve` throughput, TTFT, TPOT,
-  and inter-token-latency output.
-
-### Async versus sync scheduling
-
-The scheduling comparison uses one installed vLLM version and explicitly passes
-`--async-scheduling` or `--no-async-scheduling`. Every paired trial uses the same random seed,
-starts a fresh server, warms it before profiling, and alternates mode order. Run it remotely:
+The measured serving window is `gpu_memory:vllm:serve:bench`, excluding startup and warmup. Fetch
+the output prefix printed by the detached launcher:
 
 ```bash
-scripts/vllm_bw.sh compare --remote --detach \
-  --host hinton-01 --remote-dir ~/code/attention-bw -- \
-  --model phi-3-mini \
-  --random-input-len 2048 \
-  --random-output-len 64 \
-  --num-prompts 256 \
-  --max-num-seqs 256 \
-  --max-concurrency 256 \
-  --request-rate inf \
-  --repetitions 5
+scripts/vllm-server.sh fetch --out results/vllm_serve_nsys_<timestamp>
 ```
 
-Fetch the printed output directory with `scripts/vllm_bw.sh fetch ...`. Its `impact.csv` reports
-the async-minus-sync change in output tokens/second and average DRAM bandwidth utilization.
-`trials.csv`, `summary.csv`, `paired_comparison.csv`, `policy_comparison.csv`, and
-`comparison.png` expose trial-level values and variance. DRAM utilization is the NSYS percentage
-of sustained peak, averaged only between the first and last active DRAM sample in the client
-benchmark; server startup and warmup are outside the trace.
-
-The Feather paper's `radix_cost`, `chunked_hash_tree_bandit`, and plain CHT policies are vendored
-in `vllm_bw/schedulers/`. `chunked_hash_tree_python` and `chunked_hash_tree_cpp` expose equivalent
-plain-CHT queue behavior with a 500-token chunk size so their scheduler overhead can be compared
-directly. The installer patches an official pinned vLLM wheel in an isolated remote environment;
-it does not clone or read the original research repository:
-
-- `vllm_bw/schedulers/radix_cost/`: token-level radix policy
-- `vllm_bw/schedulers/chunked_hash_tree/`: Python CHT and contextual bandit
-- `vllm_bw/schedulers/*.cpp`: native CHT implementations
-- `vllm_bw/schedulers/policy_request_queues.py`: vLLM adapter
+Compare paired async/sync scheduling trials:
 
 ```bash
-scripts/vllm_bw.sh install-policies --remote --detach \
-  --host hinton-01 --remote-dir ~/code/attention-bw
+scripts/vllm-server.sh compare --remote --detach -- \
+  --model phi-3-mini --random-input-len 2048 --random-output-len 64 \
+  --num-prompts 256 --max-num-seqs 256 --max-concurrency 256 \
+  --request-rate inf --repetitions 5
 ```
 
-Then compare several request policies while retaining paired async/sync trials:
+The comparison writes trial, summary, paired-comparison, policy-comparison, and impact CSVs plus a
+comparison figure. Custom `radix_cost`, `chunked_hash_tree_python`,
+`chunked_hash_tree_cpp`, and `chunked_hash_tree_bandit` policies live under
+`gpu_memory_benchmarks/serving/schedulers/`. Install the pinned policy-enabled vLLM environment
+with:
 
 ```bash
-scripts/vllm_bw.sh compare --remote --detach \
-  --host hinton-01 --remote-dir ~/code/attention-bw -- \
-  --scheduling-policies fcfs radix_cost chunked_hash_tree_bandit \
-  --model llama-3.1-8b \
-  --max-model-len 10240 \
-  --random-prefix-len 10000 \
-  --random-input-len 20 \
-  --random-output-len 50 \
-  --num-prompts 1000 \
-  --max-num-seqs 100 \
-  --max-concurrency 100 \
-  --repetitions 3
+scripts/vllm-server.sh install-policies --remote --detach
 ```
 
-The wrapper automatically selects the isolated policy-enabled vLLM when a custom policy is
-requested. Set `VLLM_POLICY_VENV` to override its default location,
-`~/.cache/vllm_bw/policy_venv`.
+The default isolated environment is `~/.cache/gpu-memory-benchmarks/vllm/policy_venv`.
+`VLLM_BENCH_PROFILE_SCHEDULER=1` enables scheduler timing and
+`VLLM_BENCH_PROFILE_INTERVAL` controls cumulative logging.
 
-Set `VLLM_BW_PROFILE_SCHEDULER=1` to time `Scheduler.schedule()` and the custom queue
-operations. `scheduler_timings.csv` and `scheduler_timing_summary.csv` contain the trial-level
-and aggregated timings; `VLLM_BW_PROFILE_INTERVAL` controls the cumulative log interval.
+### Detailed EngineCore timing
 
-### Detailed EngineCore step and GPU model timing
-
-Install the vLLM 0.22.1 instrumentation once after syncing it to the GPU host:
+Instrumentation targets upstream vLLM 0.22.1. Install it on the GPU host, then profile CPU phase
+timings or CUDA model execution:
 
 ```bash
-scripts/vllm_bw.sh install-timing --remote \
-  --host hinton-01 --remote-dir ~/code/attention-bw
-```
+scripts/vllm-server.sh install-timing --remote
 
-The `overhead` profile records exclusive regions in both `EngineCore.step` implementations:
-request checks, scheduling, model submission, grammar masks, future waits, sampling, queue
-operations, abort handling, and output updates. It writes a reconciled CSV whose rows sum to the
-complete step; `unmeasured_python_between_regions` is the measured residual for branches,
-context-manager entry/exit, and return bookkeeping.
-
-```bash
-scripts/vllm_bw.sh profile overhead --remote --detach \
-  --host hinton-01 --remote-dir ~/code/attention-bw \
+scripts/vllm-server.sh profile overhead --remote --detach \
   --out results/vllm_step_breakdown_sync -- \
   --model llama-3.1-8b --scheduling-mode sync \
   --max-model-len 10240 --random-prefix-len 10000 --random-input-len 20 \
   --random-output-len 50 --num-prompts 300 --max-num-seqs 100 \
   --max-concurrency 100 --request-rate inf
-```
 
-Repeat with `--scheduling-mode async` and a distinct output prefix. `<out>_timing.csv` is the
-exclusive reconciled step budget (including zero-call branches), while `<out>_timing_raw.csv`
-retains every cumulative function timer such as model execution and input preparation.
-
-The `model-gpu` profile runs the same serving workload under Nsight Systems. Instrumentation adds
-nested NVTX ranges around `GPUModelRunner.execute_model` and its input-preparation method. NSYS's
-GPU-projection report therefore gives GPU duration for the whole execution range and for input
-preparation; subtracting the latter confirms the report's "execute model, excluding preparation"
-measurement. A CUDA-kernel summary is emitted as a separate cross-check.
-
-```bash
-scripts/vllm_bw.sh profile model-gpu --remote --detach \
-  --host hinton-01 --remote-dir ~/code/attention-bw \
+scripts/vllm-server.sh profile model-gpu --remote --detach \
   --out results/vllm_model_gpu_sync -- \
   --model llama-3.1-8b --scheduling-mode sync \
   --max-model-len 10240 --random-prefix-len 10000 --random-input-len 20 \
@@ -357,56 +215,32 @@ scripts/vllm_bw.sh profile model-gpu --remote --detach \
   --max-concurrency 100 --request-rate inf
 ```
 
-Fetch either detached run with `scripts/vllm_bw.sh fetch ...`. The GPU run returns
-`<out>_model_gpu.csv` (NVTX GPU projections) and `<out>_kernel_summary.csv`; raw `.nsys-rep` and
-SQLite files remain on the remote host.
+CPU timing, py-spy, and NSYS runs should remain separate because combining them changes the
+measurement. CPU `execute_model` duration measures asynchronous host submission; CUDA events are
+used when actual GPU duration is required.
 
-Interpretation: if DRAM p95 is close to sustained peak while SM activity is materially lower,
-decode is behaving as memory-bound and remaining gains likely need better memory locality,
-batching, KV-cache layout, or quantization. If DRAM p95 is far below peak during the measured
-window, there is likely serving/runtime overhead, insufficient concurrency, model-size effects,
-or another bottleneck leaving bandwidth on the table. Increase `--num-prompts`,
-`--max-num-seqs`, or `--max-concurrency` to push harder before concluding the kernel path itself
-is not bandwidth-limited.
+## Direct CLI and visualization
 
-## Profiling details
-
-- **NVTX ranges** wrap warmup and measured iterations (`...:warmup`, `...:iter`, `...:case`). The
-  profiler wrappers filter on these so that warmup work is excluded from the reported metrics.
-- **Nsight Compute** collects: `dram__bytes_read.sum`, `dram__bytes_write.sum`,
-  `dram__throughput.avg.pct_of_peak_sustained_elapsed`,
-  `sm__throughput.avg.pct_of_peak_sustained_elapsed`, `gpu__time_duration.sum`. The visualizer
-  pivots these per kernel and classifies kernels into types (attention / linear / norm / … for
-  `llm_bw`; the three SDPA backends for `attention_bw`).
-- **Nsight Systems** captures GPU-metric timelines (DRAM throughput %, SMs-active %) plus the CUDA
-  kernel trace, exported to SQLite for plotting bandwidth and SM utilization over time.
-
-## Visualization
-
-The remote wrappers visualize automatically. To re-render from a raw profiler artifact (CSV from
-`ncu`, `.sqlite` from `nsys`) directly:
+On a configured GPU host, the wrappers are optional:
 
 ```bash
-# attention_bw
-uv run main.py visualize results/attention_bw_ncu_<ts>.csv  -o out.png
-uv run main.py visualize results/attention_bw_nsys_<ts>.sqlite -o out.png
-
-# llm_bw (config flags only annotate the plot title)
-uv run llm_main.py visualize results/llm_bw_ncu_<ts>.csv -o out.png \
-  --model phi-3-mini --dtype fp16 --attention sdpa --prompt-length 512
+uv run gpu-memory-benchmarks attention run --kernels all --shape 2,64,4096,128
+uv run gpu-memory-benchmarks model run --model phi-3-mini --decode-tokens 50
+uv run gpu-memory-benchmarks prefix-cache homogeneity \
+  -o results/prefix_homogeneity.csv --model llama-7b
 ```
 
-The file extension selects the path: `.csv` → Nsight Compute view, `.sqlite` → Nsight Systems
-timeline view.
-
-## Running directly on a GPU host
-
-Omit `--remote` to use any suite script directly on a GPU host. The scripts are grouped by
-benchmark: `attention_bw.sh`, `llm_bw.sh`, `component_bw.sh`, `prefix_bw.sh`, and `vllm_bw.sh`.
-The Python entry points remain available:
+Existing profiler artifacts can be rendered without a GPU:
 
 ```bash
-uv run main.py run --kernels all --shape 2,64,4096,128
-uv run llm_main.py run --model phi-3-mini --decode-tokens 50
-uv run prefix_main.py homogeneity -o results/prefix_homo.csv --model llama-7b
+uv run gpu-memory-benchmarks attention visualize results/attention_ncu_<timestamp>.csv -o out.png
+uv run gpu-memory-benchmarks model visualize results/model_nsys_<timestamp>.sqlite -o out.png
+uv run gpu-memory-benchmarks vllm summarize trace.sqlite -o summary.csv
 ```
+
+## Studies
+
+- [Synthetic component saturation](docs/component_saturation_study.md)
+- [vLLM scheduling and request policies](docs/vllm_scheduling_study.md)
+- [vLLM attention backend comparison](docs/vllm_attention_backend_study.md)
+- [vLLM CPU overhead investigation](docs/vllm_cpu_overhead_study.md)

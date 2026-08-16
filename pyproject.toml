@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gpu-benchmarks"
+version = "0.1.0"
+description = "Reproducible NVIDIA GPU benchmarks for LLM inference"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "matplotlib>=3.10,<4",
+    "numpy>=2.2,<3",
+    "pandas>=2.2,<4",
+    "xxhash>=3.5,<4",
+]
+
+[project.optional-dependencies]
+model = [
+    "accelerate>=0.30",
+    "sentencepiece>=0.2",
+    "torch>=2.4",
+    "transformers>=4.40",
+]
+serving = ["vllm==0.22.1"]
+
+[project.scripts]
+gpu-memory-benchmarks = "gpu_benchmarks.cli:main"
+
+[tool.hatch.build]
+exclude = [
+    "/.venv",
+    "/dist",
+    "/results",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15",
+    "ty>=0.0.34",
+]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
