@@ -12,6 +12,7 @@ StageName = Literal[
     "paged_full_model",
 ]
 LayoutName = Literal["replicated", "shared", "paged"]
+PrefixSharingName = Literal["unique", "shared"]
 
 STAGES: tuple[StageName, ...] = (
     "attention_kernel",
@@ -144,6 +145,11 @@ def layout_for_stage(stage: StageName, layout: LayoutName) -> LayoutName:
     return layout
 
 
+def prefix_sharing_for_layout(layout: LayoutName) -> PrefixSharingName:
+    """Return whether requests refer to distinct or shared prefix storage."""
+    return "unique" if layout == "replicated" else "shared"
+
+
 def estimate_layer_param_count(
     config: SyntheticConfig,
     include_attention: bool = True,
@@ -195,11 +201,10 @@ def estimate_kv_cache_bytes(stage: StageName, config: SyntheticConfig, batch_siz
     if layers == 0:
         return 0
 
-    layout = layout_for_stage(stage, config.layout)
-    if layout == "replicated":
-        physical_tokens = batch_size * (config.prefix_len + config.decode_tokens)
+    if prefix_sharing_for_layout(config.layout) == "unique":
+        physical_tokens = batch_size * config.prefix_len
     else:
-        physical_tokens = config.prefix_len + batch_size * config.decode_tokens
+        physical_tokens = config.prefix_len
 
     return physical_tokens * layers * config.num_key_value_heads * config.head_dim * 2 * config.dtype_bytes
 
@@ -231,8 +236,7 @@ def estimate_physical_kv_read_bytes(stage: StageName, config: SyntheticConfig, b
     layers = layers_for_stage(stage, config)
     if layers == 0:
         return 0
-    layout = layout_for_stage(stage, config.layout)
-    physical_batch = batch_size if layout == "replicated" else 1
+    physical_batch = batch_size if prefix_sharing_for_layout(config.layout) == "unique" else 1
     return (
         physical_batch
         * config.prefix_len

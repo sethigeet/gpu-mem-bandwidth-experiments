@@ -95,7 +95,9 @@ The component ladder separates increasingly complete decode paths:
 - `paged_attention`: attention with a PyTorch block-table KV gather.
 - `paged_full_model`: the full synthetic model with the same paged-KV approximation.
 
-KV layouts are `replicated`, `shared`, and `paged`. Start with a smoke run:
+KV layouts are `replicated`, `shared`, and `paged`. Replicated prefixes are unique per request;
+shared and paged prefixes refer to one physical prefix. The explicitly paged stages honor the
+requested prefix-sharing mode while always using block-table storage. Start with a smoke run:
 
 ```bash
 scripts/components.sh nsys --remote -- \
@@ -111,9 +113,21 @@ scripts/components.sh sweep-bundle --remote --detach \
   --batch-sizes 1 2 4 8 16 32 40 48 64 128 256 512 1024
 ```
 
+For short, non-shared prompts, use the replicated layout. Larger batches are useful because the
+shorter attention path can keep scaling after the long-prefix sweep has saturated:
+
+```bash
+scripts/components.sh sweep-bundle --remote --detach \
+  --out results/components_128_unique_batch_sweep -- \
+  --model phi-3-mini --prefix-len 128 --decode-tokens 64 --layout replicated \
+  --batch-sizes 1 2 4 8 16 32 64 128 256 512 1024 2048 4096 8192
+```
+
 The NCU sweep uses kernel replay by default and checkpoints every stage/batch pair with `.done`
 or `.skipped`. Infeasible paged points do not abort the dense-stage sweep. Override the NCU batch
-list with `COMPONENT_BATCH_SIZES` when needed.
+list with `COMPONENT_BATCH_SIZES` when needed. Set `COMPONENT_NCU_PROFILE=memory-hierarchy` for a
+diagnostic counter pass that adds L1/L2 hit rates, HBM sectors, occupancy, SM compute/pipe
+throughput, and memory- versus math-stall indicators.
 
 Combine a throughput CSV and per-stage NCU files into data and a figure:
 

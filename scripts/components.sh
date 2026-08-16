@@ -30,7 +30,7 @@ if [[ "$COMMON_REMOTE" == true ]]; then
   sync_project "$COMMON_HOST" "$COMMON_REMOTE_DIR"
   REMOTE_DIR_ABS=$(resolve_remote_dir "$COMMON_HOST" "$COMMON_REMOTE_DIR")
   REMOTE_ARGS=(env)
-  for variable in NCU_METRICS NCU_REPLAY_MODE COMPONENT_BATCH_SIZES; do
+  for variable in NCU_METRICS NCU_REPLAY_MODE COMPONENT_BATCH_SIZES COMPONENT_NCU_PROFILE; do
     [[ ! -v "$variable" ]] || REMOTE_ARGS+=("${variable}=${!variable}")
   done
   REMOTE_ARGS+=(./scripts/components.sh "$COMMAND" --out "$OUT" -- "${COMMON_EXTRA[@]}")
@@ -55,13 +55,20 @@ if [[ "$COMMON_REMOTE" == true ]]; then
 fi
 
 mkdir -p "$(dirname "$OUT")"
+UTILIZATION_METRICS="dram__throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,sm__cycles_active.avg.pct_of_peak_sustained_elapsed,gpu__time_duration.sum"
+MEMORY_HIERARCHY_METRICS="dram__throughput.avg.pct_of_peak_sustained_elapsed,dram__sectors_read.sum,dram__sectors_write.sum,l1tex__t_sector_hit_rate.pct,lts__t_sector_hit_rate.pct,lts__t_sectors_aperture_device_lookup_hit.sum,lts__t_sectors_aperture_device_lookup_miss.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,sm__cycles_active.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active,sm__inst_executed.avg.pct_of_peak_sustained_elapsed,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_elapsed,smsp__issue_active.avg.pct_of_peak_sustained_elapsed,smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct,smsp__warp_issue_stalled_lg_throttle_per_warp_active.pct,smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct,gpu__time_duration.sum"
+case "${COMPONENT_NCU_PROFILE:-utilization}" in
+  utilization) PROFILE_METRICS=$UTILIZATION_METRICS ;;
+  memory-hierarchy) PROFILE_METRICS=$MEMORY_HIERARCHY_METRICS ;;
+  *) echo "Unknown COMPONENT_NCU_PROFILE: ${COMPONENT_NCU_PROFILE}" >&2; exit 2 ;;
+esac
 case "$COMMAND" in
   ncu)
     ncu \
       --target-processes all \
       --replay-mode "${NCU_REPLAY_MODE:-kernel}" \
       --nvtx --nvtx-include "regex:gpu_memory:components:.*:iter]" \
-      --metrics "${NCU_METRICS:-dram__bytes_read.sum,dram__bytes_write.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__time_duration.sum}" \
+      --metrics "${NCU_METRICS:-$PROFILE_METRICS}" \
       --csv --log-file "${OUT}.csv" \
       uv run gpu-memory-benchmarks components run "${COMMON_EXTRA[@]}" --decode-tokens 1 --warmup-tokens 2
     ;;
@@ -115,7 +122,7 @@ case "$COMMAND" in
         fi
         echo "__COMPONENT_NCU_BATCH_${batch_size}_STAGE_START_${stage}__"
         if NCU_REPLAY_MODE=${NCU_REPLAY_MODE:-kernel} \
-          NCU_METRICS=${NCU_METRICS:-dram__throughput.avg.pct_of_peak_sustained_elapsed,gpu__time_duration.sum} \
+          NCU_METRICS=${NCU_METRICS:-$PROFILE_METRICS} \
           "$0" ncu --out "$stage_output" -- \
           "${COMMON_EXTRA[@]}" --stage "$stage" --batch-size "$batch_size"; then
           touch "${stage_output}.done"

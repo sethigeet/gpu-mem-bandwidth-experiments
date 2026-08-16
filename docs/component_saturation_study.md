@@ -1,68 +1,137 @@
-# Component Bandwidth 10K Shared-prefix Batch Sweep
+# Component Batch Saturation: Shared and Unique Prefixes
 
 ## Methodology
 
 - Hardware: NVIDIA RTX 6000 Ada Generation (48 GB).
-- Workload: Phi-3-mini-shaped synthetic decode ladder with `prefix_len=10000`, `dtype=fp16`, and `layout=shared`.
-- Batch sizes: `1, 2, 4, 8, 16, 32, 40, 48, 64, 128, 256, 512, 1024`, subject to each stage's memory limit.
-- Throughput: 64 measured decode iterations after five warmup iterations, with CUDA synchronization around each stage.
-- DRAM/SM utilization: Nsight Compute profiles one measured decode iteration per stage and batch size. Warmup is excluded by the `gpu_memory:components:<stage>:iter` NVTX filter.
-- NCU counters: `dram__throughput.avg.pct_of_peak_sustained_elapsed`, `sm__throughput.avg.pct_of_peak_sustained_elapsed`, and `gpu__time_duration.sum`.
-- Aggregation: reported DRAM and SM utilization are kernel-duration-weighted means across the measured stage.
-- Saturation batch: the first measured batch that reaches at least 95% of that stage's maximum observed throughput.
+- Model shape: Phi-3-mini-shaped synthetic decode ladder in FP16.
+- Long shared-prefix workload: one physically shared 10,000-token K/V prefix expanded across the batch.
+- Short unique-prefix workload: a distinct 128-token K/V prefix for every request. Paged stages use
+  disjoint physical block ranges for every request as well.
+- Throughput: 64 measured decode iterations after five warmup iterations, with CUDA synchronization
+  around each stage.
+- Long-workload batches: `1, 2, 4, 8, 16, 32, 40, 48, 64, 128, 256, 512, 1024`.
+- Short-workload batches: the same series plus `2048, 4096, 8192`, subject to each stage's memory limit.
+- Nsight Compute: one measured decode iteration after two warmup iterations, using kernel replay and
+  the `gpu_memory:components:<stage>:iter` NVTX filter.
+- Saturation batch: the first measured batch reaching at least 95% of that stage's maximum observed
+  throughput.
 
-The paged approximation gathers 10K-token K/V blocks into batch-sized dense tensors. Its memory use therefore grows much faster with batch size than the shared dense-cache stages. Infeasible points are recorded as explicit skips instead of aborting the sweep.
+The profiler pass measures DRAM throughput, DRAM read/write sectors, L1/TEX and L2 hit rates, L2
+hit/miss sectors, SM compute throughput, active SM cycles, achieved occupancy, instruction issue,
+tensor/FMA pipe activity, and warp-stall reasons. Percentages shown for a whole component are
+kernel-duration-weighted means.
+
+The main sweep figures show both **math-pipe activity**, computed per kernel as the larger of
+Tensor-pipe and FMA-pipe activity, and **SM active cycles**. This separates arithmetic-pipeline use
+from the fraction of elapsed cycles in which the SMs were doing any work. The broader NCU composite
+`sm__throughput.avg.pct_of_peak_sustained_elapsed` is retained separately in the diagnostics as
+**composite SM throughput**.
+
+There is no literal “HBM miss” cache event: an L2 miss that is satisfied from device memory produces
+DRAM sectors. The study therefore uses L2 misses together with measured DRAM sectors/bytes to track
+traffic reaching HBM.
 
 ## Component Parameter Counts
 
-These are the trainable tensor parameters instantiated by each synthetic stage. They exclude the K/V cache and temporary activations, which are runtime data rather than model parameters. All projections are bias-free. Parameter storage assumes the benchmark's FP16 dtype.
+The counts below exclude K/V caches and temporary activations. All projections are bias-free and
+storage assumes FP16.
 
-| stage | included modules | parameters | FP16 parameter storage |
-| --- | --- | ---: | ---: |
-| attention_kernel | direct SDPA only | 0 | 0 B |
-| attention_layer | Q, K, V, and output projections | 37,748,736 (37.75M) | 72.00 MiB |
-| mlp | gate, up, and down projections | 75,497,472 (75.50M) | 144.00 MiB |
-| block | attention + MLP + two RMSNorms | 113,252,352 (113.25M) | 216.01 MiB |
-| decoder_stack | 32 decoder blocks | 3,624,075,264 (3.624B) | 6.75 GiB |
-| full_model | embeddings + 32 blocks + final norm + LM head | 3,821,079,552 (3.821B) | 7.12 GiB |
-| paged_attention | same parameterized attention layer; paged K/V is runtime state | 37,748,736 (37.75M) | 72.00 MiB |
-| paged_full_model | same model parameters; paged K/V is runtime state | 3,821,079,552 (3.821B) | 7.12 GiB |
+| stage            | included modules                              |             parameters | FP16 parameter storage |
+| ---------------- | --------------------------------------------- | ---------------------: | ---------------------: |
+| attention_kernel | direct SDPA only                              |                      0 |                    0 B |
+| attention_layer  | Q, K, V, and output projections               |    37,748,736 (37.75M) |              72.00 MiB |
+| mlp              | gate, up, and down projections                |    75,497,472 (75.50M) |             144.00 MiB |
+| block            | attention + MLP + two RMSNorms                |  113,252,352 (113.25M) |             216.01 MiB |
+| decoder_stack    | 32 decoder blocks                             | 3,624,075,264 (3.624B) |               6.75 GiB |
+| full_model       | embeddings + 32 blocks + final norm + LM head | 3,821,079,552 (3.821B) |               7.12 GiB |
+| paged_attention  | attention layer with paged K/V runtime state  |    37,748,736 (37.75M) |              72.00 MiB |
+| paged_full_model | full model with paged K/V runtime state       | 3,821,079,552 (3.821B) |               7.12 GiB |
 
-## Results
+## 128-token Unique-prefix Results
 
-![Component throughput and DRAM utilization versus batch size](assets/component_saturation.png)
+![128-token unique-prefix throughput, DRAM bandwidth, math-pipe activity, and SM active cycles](assets/component_saturation_128_unique.png)
 
-### Saturation Summary
+| stage            | saturation batch | peak batch | peak throughput (tok/s) | DRAM at peak | math pipe at peak | L2 hit at peak | largest batch | endpoint throughput (tok/s) | endpoint DRAM |
+| ---------------- | ---------------: | ---------: | ----------------------: | -----------: | ----------------: | -------------: | ------------: | --------------------------: | ------------: |
+| attention_kernel |               32 |         48 |            1,005,914.66 |       88.59% |            30.45% |         53.94% |          8192 |                  389,241.20 |        70.21% |
+| attention_layer  |              128 |        256 |              380,502.31 |       80.98% |            30.24% |         62.32% |          8192 |                  309,579.02 |        61.74% |
+| mlp              |              512 |        512 |            1,165,442.84 |       37.70% |            58.22% |         88.36% |          8192 |                  912,502.66 |        17.58% |
+| block            |              256 |        256 |              229,862.68 |       70.52% |            33.09% |         66.25% |          8192 |                  189,911.44 |        52.03% |
+| decoder_stack    |              256 |        512 |                5,804.18 |       58.28% |            35.22% |         67.72% |           512 |                    5,804.18 |        58.28% |
+| full_model       |              256 |        512 |                5,744.14 |       58.07% |            35.52% |         67.96% |           512 |                    5,744.14 |        58.07% |
+| paged_attention  |               32 |         32 |               98,747.27 |       81.48% |            12.37% |         49.12% |          4096 |                   79,240.62 |        68.56% |
+| paged_full_model |              128 |        256 |                2,498.00 |       71.92% |            14.62% |         55.62% |           256 |                    2,498.00 |        71.92% |
 
-| stage | saturation batch (95%) | peak batch | peak throughput (tok/s) | DRAM util at peak | SM util at peak | largest feasible batch | endpoint throughput (tok/s) | endpoint DRAM util |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| attention_kernel | 2 | 2 | 14,119.90 | 93.15% | 17.24% | 1024 | 9,069.98 | 0.21% |
-| attention_layer | 4 | 40 | 10,539.44 | 7.40% | 75.78% | 1024 | 9,447.82 | 0.30% |
-| mlp | 512 | 512 | 1,170,219.72 | 38.14% | 58.22% | 1024 | 1,080,316.53 | 26.91% |
-| block | 40 | 256 | 9,509.33 | 2.70% | 84.84% | 1024 | 9,273.03 | 1.02% |
-| decoder_stack | 256 | 256 | 293.84 | 2.71% | 84.85% | 512 | 289.15 | 1.54% |
-| full_model | 256 | 256 | 294.21 | 2.76% | 84.80% | 512 | 289.69 | 1.58% |
-| paged_attention | 2 | 4 | 1,279.07 | 88.26% | 32.27% | 64 | 1,028.46 | 91.43% |
-| paged_full_model | 4 | 4 | 34.66 | 86.80% | 30.16% | 40 | 31.26 | 91.31% |
+![128-token unique-prefix memory-hierarchy diagnostics](assets/component_saturation_128_unique_diagnostics.png)
+
+The short unique attention kernel reaches 95% of peak throughput at batch 32 and peaks at batch 48.
+Its HBM traffic stays almost constant at approximately 1.5 MiB per output token from batch 1 through
+8192, and its L2 hit rate stays near 54-61%. DRAM utilization therefore remains high: 88.59% at the
+throughput peak and 70.21% at batch 8192. This is the expected behavior when each request has distinct
+K/V data and cross-request prefix reuse is unavailable.
+
+The unique full model scales to batch 512 and 5,744 tok/s. Weight traffic is amortized across the
+batch, so its HBM traffic falls from 7,173.6 MiB/token at batch 1 to 70.3 MiB/token at batch 512 and
+its L2 hit rate rises from 16.6% to 68.0%. Unlike the shared-prefix workload, however, its distinct K/V
+traffic remains and DRAM utilization is still 58.07% at saturation.
+
+## 10K-token Shared-prefix Results
+
+![10K shared-prefix throughput, DRAM bandwidth, math-pipe activity, and SM active cycles](assets/component_saturation.png)
+
+| stage            | saturation batch | peak batch | peak throughput (tok/s) | DRAM at peak | math pipe at peak | L2 hit at peak | largest batch | endpoint throughput (tok/s) | endpoint DRAM |
+| ---------------- | ---------------: | ---------: | ----------------------: | -----------: | ----------------: | -------------: | ------------: | --------------------------: | ------------: |
+| attention_kernel |                2 |          4 |               13,972.83 |       92.39% |            30.65% |         75.09% |          1024 |                    8,857.14 |         0.19% |
+| attention_layer  |                4 |          4 |               10,241.05 |       89.86% |            23.82% |         60.26% |          1024 |                    9,196.72 |         0.29% |
+| mlp              |              512 |       1024 |            1,177,504.09 |       26.32% |            72.58% |         92.44% |          1024 |                1,177,504.09 |        26.32% |
+| block            |               16 |         16 |                9,591.40 |       26.90% |            58.48% |         84.01% |          1024 |                    9,061.81 |         0.92% |
+| decoder_stack    |              256 |        256 |                  286.14 |        2.51% |            84.83% |         99.04% |          1024 |                      280.64 |         0.81% |
+| full_model       |              256 |        256 |                  286.04 |        2.57% |            84.81% |         99.02% |          1024 |                      280.50 |         0.82% |
+| paged_attention  |                2 |          4 |                1,264.47 |       88.24% |            14.42% |         49.04% |            64 |                      996.40 |        91.10% |
+| paged_full_model |                4 |          4 |                   34.17 |       86.82% |            13.54% |         47.26% |            40 |                       29.93 |        91.24% |
+
+![10K shared-prefix memory-hierarchy diagnostics](assets/component_saturation_diagnostics.png)
 
 ## Interpretation
 
-1. **The full dense stack saturates around batch 256.** `decoder_stack` and `full_model` peak at 293.84 and 294.21 tok/s, respectively, at batch 256. Batch 512 changes throughput by less than 2%. Batch 1024 exceeds the runtime memory limit for these two stages.
+1. **The shared-prefix DRAM collapse is cache reuse, followed by a compute-bound regime.** For the
+   full model, L2 hit rate rises from 26.56% at batch 1 to 99.68% at batch 1024. HBM traffic falls from
+   10,975.8 MiB/token to 19.4 MiB/token, while memory-dependency stalls fall from 46.88% to 0.95%.
+   Over the same range, composite SM throughput rises from 13.50% to 86.62% and math-pipe throttle
+   stalls rise from 2.65% to 49.88%. The bandwidth curve is therefore falling because progressively
+   less work reaches HBM and execution has shifted to the compute pipelines.
 
-2. **The MLP needs the largest batch to saturate.** Its throughput scales to 1.17 million tok/s at batch 512, then falls by 7.7% at batch 1024. Its peak weighted DRAM utilization is only 38.14%, so peak throughput is not associated with saturating DRAM bandwidth.
+2. **The isolated shared attention kernel shows the same transition more starkly.** From batch 1 to
+   1024, L2 hit rate rises from 50.99% to 99.94%, HBM traffic falls from 120.4 MiB/token to
+   0.126 MiB/token, and DRAM utilization falls from 90.02% to 0.19%. Math-pipe activity rises from
+   14.42% to 87.08%. Its roughly flat token throughput after the early peak means elapsed time grows
+   with batch size even though almost all physical prefix reads are served from cache.
 
-3. **The shared-cache attention paths saturate early.** The isolated attention kernel peaks at batch 2. The full attention layer reaches 95% of its observed maximum by batch 4 and peaks at batch 40. Increasing batch size beyond that adds no throughput.
+3. **Active SMs are not the same as utilized compute.** The unique attention kernel at batch 8192 has
+   99.98% SM active cycles but only 22.27% math-pipe activity. In contrast, the shared full model
+   at batch 1024 has 99.67% active cycles and 86.59% math-pipe activity. The former keeps nearly every
+   SM occupied with memory-heavy attention work; the latter drives the compute pipelines close to
+   their sustained limit.
 
-4. **Dense shared-cache DRAM utilization falls while SM utilization rises.** At small batches, the attention and block paths show high instantaneous DRAM utilization. At large batches, reuse of the one physically shared K/V prefix amortizes DRAM traffic while compute and kernel execution grow. At the batch-256 model throughput peak, DRAM utilization is only 2.76% while SM utilization is 84.80%. The dense model is compute-bound rather than DRAM-bandwidth-bound at saturation in this shared-cache synthetic layout.
+4. **Unique short prefixes remove the extreme cross-request reuse.** The unique attention kernel's
+   HBM bytes per token stay nearly constant and its DRAM utilization remains 70-94% over the large
+   batches. Its full model is still helped by weight amortization and normal cache reuse, but remains
+   at 58% DRAM utilization at its batch-512 throughput peak instead of the shared model's 2.6% at its
+   batch-256 peak.
 
-5. **The paged approximation is the clear memory-bandwidth bottleneck.** `paged_attention` and `paged_full_model` remain around 87-91% of peak DRAM throughput while SM utilization stays around 30-35% and token throughput saturates by batches 2-4. Page gathering materializes dense K/V tensors, so it both consumes bandwidth and limits the largest feasible batch to 64 for paged attention and 40 for the paged model.
-
-6. **The original batch-32 result hid two different regimes.** Batch 32 was already past saturation for isolated/shared attention and the paged stages, but it was too small to expose the batch-256 full-model plateau or the batch-512 MLP plateau.
+5. **Paged materialization remains bandwidth-bound.** The 10K paged stages remain around 87-91% DRAM
+   utilization with only about 14% math-pipe activity and reach their memory limits at batches
+   64 and 40. With 128-token unique prefixes, the paged stages scale farther, but their peak DRAM
+   utilization is still 72-81% and math-pipe activity is only about 12-15%.
 
 ## Artifacts
 
-- Checked-in figure: `docs/assets/component_saturation.png`
-- Raw throughput, NCU, and remote-log artifacts remain in the run output directory and are not
-  version-controlled.
+- Shared-prefix saturation figure: `docs/assets/component_saturation.png`
+- Shared-prefix hierarchy diagnostics: `docs/assets/component_saturation_diagnostics.png`
+- Unique-prefix saturation figure: `docs/assets/component_saturation_128_unique.png`
+- Unique-prefix hierarchy diagnostics: `docs/assets/component_saturation_128_unique_diagnostics.png`
+- Raw throughput, per-kernel NCU CSVs, summaries, skip markers, and remote logs remain in the remote
+  run output directory and are not version-controlled.
 
-NCU uses kernel replay, so its profiled wall times are not throughput measurements. Throughput and DRAM-utilization values come from separate runs with the same stage, shape, and batch size.
+NCU uses kernel replay, so profiler wall times are not throughput measurements. Throughput and NCU
+values come from separate runs with identical stage, model shape, prefix layout, and batch size.

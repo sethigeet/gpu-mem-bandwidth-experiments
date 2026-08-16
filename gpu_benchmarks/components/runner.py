@@ -17,6 +17,7 @@ from gpu_benchmarks.components.config import (
     estimate_transient_bytes,
     layers_for_stage,
     layout_for_stage,
+    prefix_sharing_for_layout,
 )
 from gpu_benchmarks.components.modules import (
     DecoderBlock,
@@ -37,6 +38,7 @@ from gpu_benchmarks.utils import write_dict_rows
 class RunResult:
     stage: str
     layout: str
+    prefix_sharing: str
     model: str
     batch_size: int
     prefix_len: int
@@ -165,16 +167,22 @@ def _make_paged_cache(config: SyntheticConfig, stage: StageName, batch_size: int
     dtype = torch_dtype(config.dtype)
     layers = layers_for_stage(stage, config)
     num_blocks = (config.prefix_len + config.block_size - 1) // config.block_size
+    prefix_sharing = prefix_sharing_for_layout(config.layout)
+    physical_blocks = num_blocks * batch_size if prefix_sharing == "unique" else num_blocks
     shape = (
         layers,
-        num_blocks,
+        physical_blocks,
         config.num_key_value_heads,
         config.block_size,
         config.head_dim,
     )
     k_blocks = torch.randn(shape, device=config.device, dtype=dtype)
     v_blocks = torch.randn(shape, device=config.device, dtype=dtype)
-    block_table = torch.arange(num_blocks, device=config.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    block_ids = torch.arange(physical_blocks, device=config.device, dtype=torch.long)
+    if prefix_sharing == "unique":
+        block_table = block_ids.reshape(batch_size, num_blocks)
+    else:
+        block_table = block_ids.unsqueeze(0).expand(batch_size, -1)
     return PagedKVCache(k_blocks=k_blocks, v_blocks=v_blocks, block_table=block_table, block_size=config.block_size)
 
 
@@ -341,6 +349,7 @@ def run_stage(stage: StageName, config: SyntheticConfig) -> RunResult:
     result = RunResult(
         stage=stage,
         layout=layout_for_stage(stage, config.layout),
+        prefix_sharing=prefix_sharing_for_layout(config.layout),
         model=config.model,
         batch_size=batch_size,
         prefix_len=config.prefix_len,
