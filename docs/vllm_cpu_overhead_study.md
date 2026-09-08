@@ -4,7 +4,8 @@
 
 Identify where wall-clock time goes in vLLM serving for a 10K-token
 shared-prefix workload, distinguish CPU/frontend overhead from GPU execution,
-and identify concrete optimization targets.
+measure whether asynchronous execution hides heavier request-policy work, and
+identify concrete optimization targets.
 
 ## Configuration
 
@@ -32,6 +33,7 @@ their timings are not used as production estimates.
 | Online versus offline         | Success after retry           | Initial FlashInfer sampler JIT failed; rerun with `VLLM_USE_FLASHINFER_SAMPLER=0` completed                                  |
 | Torch-profiler window         | Success after retry           | The old profiler environment variable produced no trace; `--profiler-config` generated a 30.8 MB trace and summary           |
 | Fresh GPU-busy analysis       | Success after correction      | Two fresh NSYS traces analyzed; GR-active extraction was corrected to exclude cycle-count metrics                            |
+| Heavy-policy async follow-up  | Success                       | 24 clean trials covered four policies and both scheduling modes; separate NSYS runs produced three continuous-step timelines |
 
 ## Authoritative timing-only serving results
 
@@ -92,6 +94,168 @@ so it is not additive with the table:
 Detokenization consumed almost as much cumulative time as the complete output
 processor. The totals are cumulative function times and may overlap across
 threads/processes; they should not be summed with EngineCore wall time.
+
+## Heavy-policy async and CPU/GPU timeline follow-up
+
+This follow-up repeated the same 10K-prefix, 20-token suffix, 50-token output,
+300-request, concurrency-100 workload with request policies that perform more
+work than FCFS. The policy-enabled environment uses vLLM 0.14.0 because the
+vendored radix-cost and chunked-hash-tree integrations target that version.
+FCFS was rerun in the same environment as the control. These absolute numbers
+must not be compared directly with the vLLM 0.22.1 baseline above.
+
+Each policy/mode combination had three clean trials with seeds 0-2 and
+alternating execution order. Cumulative CPU timing was enabled, while py-spy,
+NSYS, CUDA events, and GPU metrics were absent. Separate diagnostic NSYS runs
+then captured CPU NVTX ranges and CUDA kernels for one sync and one async trace
+per heavy policy. The NSYS traces do not contribute to the clean throughput or
+CPU timing estimates.
+
+### Clean paired serving results
+
+| Policy | Sync throughput (tok/s) | Async throughput (tok/s) | Async change | Sync TTFT (ms) | Async TTFT (ms) | Sync TPOT (ms) | Async TPOT (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FCFS | 1,652.50 ± 20.22 | 1,689.54 ± 23.21 | +2.24% | 1,298.40 | 1,334.64 | 34.21 | 32.18 |
+| Radix cost | 1,622.50 ± 32.74 | 1,683.92 ± 17.90 | +3.79% | 1,365.24 | 1,345.94 | 34.13 | 32.19 |
+| Python chunked hash tree | 1,537.91 ± 40.48 | 1,582.81 ± 51.47 | +2.92% | 1,532.89 | 1,527.57 | 34.26 | 32.38 |
+| Chunked-hash-tree bandit | 1,654.94 ± 45.77 | 1,714.15 ± 2.99 | +3.58% | 1,288.61 | 1,313.17 | 34.48 | 31.85 |
+
+Async throughput was higher in all 12 individual pairs, not only in the four
+means. The gains ranged from 2.24% to 3.79%. TPOT improved by 5.49-7.62%, while
+TTFT moved in both directions: it improved slightly for radix cost and Python
+CHT, but regressed for FCFS and the bandit. This is consistent with async
+execution improving steady-state token cadence without guaranteeing lower
+first-token latency.
+
+### Per-iteration EngineCore budgets by scheduler
+
+The following tables apply the same exclusive phase accounting as the baseline
+budget above to each policy in the vLLM 0.14.0 follow-up. Values are means of
+the three clean timing-only trials. Percentages are relative to the mean
+EngineCore step for that policy and mode. These are CPU wall-time regions;
+`sample_tokens` and future waits can enclose or wait for GPU work, but they are
+not CUDA-event durations.
+
+#### FCFS control
+
+| Exclusive EngineCore phase                          | Sync ms/step | Sync % | Async ms/step | Async % |
+| --------------------------------------------------- | -----------: | -----: | ------------: | ------: |
+| Scheduler                                           |         2.13 |   4.52 |          2.87 |    6.51 |
+| Execute-model submission                            |        14.67 |  31.08 |         28.29 |   64.09 |
+| Sync fallback `sample_tokens`                       |        29.82 |  63.17 |             — |       — |
+| Async initial sample submission                     |            — |      — |          0.82 |    1.85 |
+| Async model/sample future wait                      |            — |      — |         11.40 |   25.83 |
+| Update from output                                  |         0.47 |   0.99 |          0.57 |    1.30 |
+| Request checks, grammar, queues, and abort handling |         0.03 |   0.07 |          0.04 |    0.09 |
+| Timer reconciliation error                          |         0.08 |   0.17 |          0.14 |    0.32 |
+| **EngineCore step**                                 |   **47.21** | **100.0** |     **44.14** | **100.0** |
+
+#### Radix cost
+
+| Exclusive EngineCore phase                          | Sync ms/step | Sync % | Async ms/step | Async % |
+| --------------------------------------------------- | -----------: | -----: | ------------: | ------: |
+| Scheduler                                           |         2.66 |   5.59 |          2.75 |    6.42 |
+| Execute-model submission                            |        13.75 |  28.94 |         27.68 |   64.53 |
+| Sync fallback `sample_tokens`                       |        30.55 |  64.29 |             — |       — |
+| Async initial sample submission                     |            — |      — |          0.90 |    2.10 |
+| Async model/sample future wait                      |            — |      — |         10.74 |   25.04 |
+| Update from output                                  |         0.45 |   0.95 |          0.63 |    1.48 |
+| Request checks, grammar, queues, and abort handling |         0.03 |   0.07 |          0.04 |    0.10 |
+| Timer reconciliation error                          |         0.07 |   0.16 |          0.15 |    0.34 |
+| **EngineCore step**                                 |   **47.52** | **100.0** |     **42.89** | **100.0** |
+
+#### Python chunked hash tree
+
+| Exclusive EngineCore phase                          | Sync ms/step | Sync % | Async ms/step | Async % |
+| --------------------------------------------------- | -----------: | -----: | ------------: | ------: |
+| Scheduler                                           |         1.98 |   4.25 |          1.95 |    4.82 |
+| Execute-model submission                            |        11.92 |  25.58 |         26.06 |   64.55 |
+| Sync fallback `sample_tokens`                       |        32.06 |  68.79 |             — |       — |
+| Async initial sample submission                     |            — |      — |          0.74 |    1.84 |
+| Async model/sample future wait                      |            — |      — |         10.72 |   26.56 |
+| Update from output                                  |         0.54 |   1.15 |          0.72 |    1.80 |
+| Request checks, grammar, queues, and abort handling |         0.03 |   0.06 |          0.04 |    0.10 |
+| Timer reconciliation error                          |         0.07 |   0.15 |          0.14 |    0.34 |
+| **EngineCore step**                                 |   **46.61** | **100.0** |     **40.37** | **100.0** |
+
+#### Chunked-hash-tree bandit
+
+| Exclusive EngineCore phase                          | Sync ms/step | Sync % | Async ms/step | Async % |
+| --------------------------------------------------- | -----------: | -----: | ------------: | ------: |
+| Scheduler                                           |         2.06 |   4.39 |          2.59 |    6.07 |
+| Execute-model submission                            |        14.22 |  30.26 |         27.36 |   63.99 |
+| Sync fallback `sample_tokens`                       |        30.10 |  64.05 |             — |       — |
+| Async initial sample submission                     |            — |      — |          0.80 |    1.87 |
+| Async model/sample future wait                      |            — |      — |         11.23 |   26.28 |
+| Update from output                                  |         0.49 |   1.05 |          0.59 |    1.38 |
+| Request checks, grammar, queues, and abort handling |         0.03 |   0.07 |          0.04 |    0.08 |
+| Timer reconciliation error                          |         0.08 |   0.17 |          0.14 |    0.33 |
+| **EngineCore step**                                 |   **47.00** | **100.0** |     **42.75** | **100.0** |
+
+Across all four policies, async reduced the mean EngineCore step by 3.07-6.24
+ms. The accounting location shifted from the sync fallback `sample_tokens`
+region to asynchronous model submission plus future completion. Scheduler time
+remained 1.95-2.87 ms/step and represented 4.25-6.51% of these shorter vLLM
+0.14.0 steps.
+
+### Where the additional policy work appears
+
+The complete `Scheduler.schedule()` call did not become uniformly more
+expensive. Much of the deliberately heavier tree work occurs when requests are
+admitted through `add_request()`, outside the top-level schedule call:
+
+| Policy | Sync `schedule` (ms/call) | Async `schedule` (ms/call) | Sync admission (ms/request) | Async admission (ms/request) |
+| --- | ---: | ---: | ---: | ---: |
+| FCFS | 2.13 | 2.90 | — | — |
+| Radix cost | 2.65 | 2.78 | 0.86 | 1.16 |
+| Python chunked hash tree | 1.98 | 1.96 | 3.96 | 5.27 |
+| Chunked-hash-tree bandit | 2.06 | 2.62 | 0.47 | 0.51 |
+
+The Python CHT has the clearest heavy CPU path: hashing and inserting one 10K
+prompt took 3.96-5.27 ms per request, approximately an order of magnitude more
+than the native CHT admission path. Its `find_best_request()` lookup remained
+only 1.12-1.37 microseconds per call. The top-level schedule values should not
+be read as a policy-only microbenchmark because each policy changes batch
+composition and the number of schedule calls.
+
+### Continuous CPU/GPU timelines
+
+Each plot uses three consecutive EngineCore steps centered in its respective
+trace. CPU ranges and GPU kernels share the NSYS clock, so direct intersection
+between the orange scheduler ranges and the GPU-kernel lane measures observed
+overlap. The `Model submit` lane contains both the EngineCore submission range
+and the CPU-side `GPUModelRunner.execute_model` wrapper; only the bottom kernel
+lane is GPU execution. Inclusive `EngineCore.step` and
+`EngineCore.step_with_batch_queue` ranges are used only for step boundaries and
+are excluded from the `Other CPU` lane; the remaining grey bars are unmatched
+instrumented operations rather than a residual or an exclusive-time total.
+
+| Policy | Sync window (ms) | Async window (ms) | Sync scheduler (ms) | Async scheduler (ms) | Sync scheduler/GPU overlap | Async scheduler/GPU overlap | Sync GPU active | Async GPU active |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Radix cost | 783.55 | 442.68 | 177.62 | 8.01 | 0.00% | 0.00% | 10.84% | 2.77% |
+| Python chunked hash tree | 114.86 | 123.02 | 2.70 | 3.04 | 0.00% | 60.59% | 36.50% | 56.11% |
+| Chunked-hash-tree bandit | 251.70 | 186.30 | 15.54 | 49.16 | 0.00% | 3.26% | 6.89% | 41.15% |
+
+![Radix-cost sync and async CPU/GPU timeline](assets/vllm_cpu_gpu_timeline_radix_cost.png)
+
+![Python chunked-hash-tree sync and async CPU/GPU timeline](assets/vllm_cpu_gpu_timeline_chunked_hash_tree_python.png)
+
+![Chunked-hash-tree bandit sync and async CPU/GPU timeline](assets/vllm_cpu_gpu_timeline_chunked_hash_tree_bandit.png)
+
+The sync snapshots show no scheduler/kernel overlap, as expected for the
+serial path. The Python-CHT async snapshot directly demonstrates the intended
+pipeline: 60.59% of scheduler time overlaps CUDA kernels, and GPU-active time
+rises from 36.50% to 56.11% within the selected window. The bandit async window
+shows a smaller 3.26% direct intersection despite much higher GPU activity.
+The selected radix window shows none.
+
+These three-step windows are diagnostic snapshots, not aggregate overlap
+estimates. They were centered independently in each trace, have different
+batch composition, and in the radix and bandit cases include expensive
+outlier calls. The lack of overlap in one radix window does not contradict its
+repeatable 3.79% throughput improvement; async can also reduce bubbles in
+other iterations or overlap future completion and request processing outside
+the selected three steps.
 
 ## GPU activity and idle time
 
@@ -214,6 +378,11 @@ throughput to 207 tok/s, so its timing is diagnostic rather than representative.
 5. **The serving pipeline leaves substantial GPU gaps.** Roughly 72-74% of
    samples were below 10% GR activity, despite individual bursts reaching full
    activity. The low wall-clock DRAM mean is primarily dilution by idle gaps.
+6. **Async helps consistently in the heavy-policy follow-up.** It improved all
+   12 paired throughput comparisons by 2.24-3.79% in the vLLM 0.14 policy
+   environment. The Python-CHT timeline directly shows scheduler/kernel
+   overlap, but the other snapshots show that overlap varies by iteration and
+   is not captured reliably by one short window.
 
 ## Optimization candidates
 
@@ -240,8 +409,9 @@ throughput to 207 tok/s, so its timing is diagnostic rather than representative.
 
 ## Limitations
 
-- Every comparison has one repetition and fixed mode order, so no statistical
-  significance can be claimed.
+- The original CPU/GPU drilldowns have one repetition and fixed mode order.
+  The heavy-policy follow-up has three paired repetitions with alternating
+  order, but still does not establish a tight confidence interval.
 - Function timers are cumulative and include nested calls; only the adjusted
   core table avoids known double counting.
 - Frontend and EngineCore process totals overlap in wall-clock time.
@@ -263,6 +433,10 @@ throughput to 207 tok/s, so its timing is diagnostic rather than representative.
   usable for the multiprocess child-worker capture because of timestamp-origin
   mismatch. Consequently, the reported GPU method duration is CUDA-event
   validated, not independently NSYS-range validated.
+- Heavy-policy results use vLLM 0.14.0 and cannot be compared absolutely with
+  the vLLM 0.22.1 baseline. Each policy timeline is one NSYS trace and only
+  three independently centered steps; its overlap percentage is a local
+  example, not a workload-wide mean.
 
 ## Artifacts
 
@@ -275,4 +449,6 @@ throughput to 207 tok/s, so its timing is diagnostic rather than representative.
   `results/vllm_scheduler_profiler_matrix_20260811/`
 - Consolidated profiler-matrix CSV:
   `results/vllm_scheduler_profiler_matrix_20260811/profiler_matrix_summary.csv`
+- Heavy-policy clean trials, timing summaries, timeline event CSVs, and plots:
+  `results/vllm_heavy_scheduler_overlap_20260816/`
 - Raw NSYS reports remain in the corresponding remote results directory.

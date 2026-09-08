@@ -32,7 +32,7 @@ if [[ "$COMMAND" == "install-timing" ]]; then
   }
   sync_project "$COMMON_HOST" "$COMMON_REMOTE_DIR"
   REMOTE_DIR_ABS=$(resolve_remote_dir "$COMMON_HOST" "$COMMON_REMOTE_DIR")
-  TIMING_ARGS=(python3 -m gpu_memory_benchmarks.serving.timing_installer)
+  TIMING_ARGS=(python3 -m gpu_benchmarks.serving.timing_installer)
   if ((${#COMMON_EXTRA[@]})); then
     TIMING_ARGS+=("${COMMON_EXTRA[@]}")
   else
@@ -50,7 +50,7 @@ if [[ "$COMMAND" == "install-policies" ]]; then
   sync_project "$COMMON_HOST" "$COMMON_REMOTE_DIR"
   REMOTE_DIR_ABS=$(resolve_remote_dir "$COMMON_HOST" "$COMMON_REMOTE_DIR")
   INSTALL_ARGS=(
-    python3 -m gpu_memory_benchmarks.serving.policy_installer
+    python3 -m gpu_benchmarks.serving.policy_installer
     "${COMMON_EXTRA[@]}"
   )
   if [[ -n ${WAIT_FOR_TMUX_SESSION:-} ]]; then
@@ -132,6 +132,7 @@ if [[ "$COMMON_REMOTE" == true ]]; then
     VLLM_BENCH_PROFILE_GPU \
     VLLM_BENCH_PROFILE_INTERVAL \
     VLLM_BENCH_PROFILE_SCHEDULER \
+    VLLM_BENCH_PROFILE_TIMELINE \
     HF_HUB_OFFLINE \
     HF_HOME \
     WAIT_FOR_TMUX_SESSION; do

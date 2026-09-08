@@ -13,6 +13,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from gpu_benchmarks.serving.timing_installer import patch_source_tree
+
 VENDORED_SCHEDULERS = Path(__file__).with_name("schedulers")
 POLICIES = (
     "fcfs",
@@ -200,9 +202,8 @@ def _install(venv_dir: Path, python: str) -> Path:
         if not (venv_dir / "pyvenv.cfg").is_file():
             raise ValueError(f"Refusing to replace non-virtual-environment directory {venv_dir}")
         shutil.rmtree(venv_dir)
-    _run([uv, "venv", "--python", python, "--seed", str(venv_dir)])
+    _run([uv, "venv", "--python", python, str(venv_dir)])
     venv_python = venv_dir / "bin/python"
-    _run([uv, "cache", "clean", "vllm"])
     _run(
         [
             uv,
@@ -252,6 +253,7 @@ def _install(venv_dir: Path, python: str) -> Path:
     _expose_custom_policy_choices(site_packages)
     _configure_request_queues(site_packages)
     _configure_scheduler(site_packages)
+    patch_source_tree(site_packages)
 
     build_dir = target_sched / "build"
     pybind_dir = subprocess.run(

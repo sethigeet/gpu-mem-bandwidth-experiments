@@ -32,7 +32,7 @@ def _vllm_executable(args: argparse.Namespace | None = None) -> str:
 def _nvtx_range(name: str):
     pushed = False
     try:
-        import torch
+        import torch  # ty: ignore[unresolved-import]
 
         torch.cuda.nvtx.range_push(name)
         pushed = True
@@ -44,7 +44,7 @@ def _nvtx_range(name: str):
     finally:
         if pushed:
             try:
-                import torch
+                import torch  # ty: ignore[unresolved-import]
 
                 torch.cuda.nvtx.range_pop()
             except Exception as exc:

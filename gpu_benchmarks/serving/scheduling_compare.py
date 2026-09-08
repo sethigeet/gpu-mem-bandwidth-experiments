@@ -26,6 +26,7 @@ from gpu_benchmarks.serving.server import (
     add_serve_profile_args,
 )
 from gpu_benchmarks.serving.visualize import extract_dram_utilization, visualize_nsys
+from gpu_benchmarks.serving.visualize.timeline import visualize_scheduler_timeline
 from gpu_benchmarks.utils import write_dict_rows
 
 
@@ -91,6 +92,18 @@ def add_scheduling_compare_args(parser: argparse.ArgumentParser) -> None:
         metavar="SECONDS",
         help="Record server and child-process CPU stacks with py-spy (0 disables)",
     )
+    parser.add_argument(
+        "--timeline-policies",
+        nargs="+",
+        default=[],
+        help=(
+            "Policies for separate NSYS CPU/GPU timeline trials after the clean comparison. "
+            "Timeline trials do not contribute throughput or timing estimates."
+        ),
+    )
+    parser.add_argument("--timeline-steps", type=int, default=3)
+    parser.add_argument("--timeline-start-step", type=int)
+    parser.add_argument("--timeline-nsys-trace", default="cuda,nvtx")
 
 
 def _probe_environment(args: argparse.Namespace, policies: list[str]) -> dict[str, str]:
@@ -488,6 +501,154 @@ def _run_trial(
     )
 
 
+def _timeline_serve_command(
+    args: argparse.Namespace,
+    model: str,
+    policy: str,
+    mode: str,
+    trial_dir: Path,
+) -> list[str]:
+    command = [
+        "uv",
+        "run",
+        "gpu-memory-benchmarks",
+        "vllm",
+        "serve",
+        "--vllm-executable",
+        _vllm_executable(args),
+        "--model",
+        model,
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--dtype",
+        args.dtype,
+        "--max-model-len",
+        str(args.max_model_len),
+        "--max-num-seqs",
+        str(args.max_num_seqs),
+        "--tensor-parallel-size",
+        str(args.tensor_parallel_size),
+        "--gpu-memory-utilization",
+        str(args.gpu_memory_utilization),
+        "--random-input-len",
+        str(args.random_input_len),
+        "--random-prefix-len",
+        str(args.random_prefix_len),
+        "--random-output-len",
+        str(args.random_output_len),
+        "--num-prompts",
+        str(args.num_prompts),
+        "--warmup-prompts",
+        str(args.warmup_prompts),
+        "--request-rate",
+        args.request_rate,
+        "--scheduling-policy",
+        policy,
+        "--scheduling-mode",
+        mode,
+        "--seed",
+        str(args.seed),
+        "--server-timeout-s",
+        str(args.server_timeout_s),
+        "--bench-timeout-s",
+        str(args.bench_timeout_s),
+        "--log-dir",
+        str(trial_dir / "logs"),
+    ]
+    if args.max_concurrency is not None:
+        command.extend(["--max-concurrency", str(args.max_concurrency)])
+    if args.attention_backend:
+        command.extend(["--attention-backend", args.attention_backend])
+    command.append("--trust-remote-code" if args.trust_remote_code else "--no-trust-remote-code")
+    command.append("--enable-prefix-caching" if args.enable_prefix_caching else "--no-enable-prefix-caching")
+    command.append("--ignore-eos" if args.ignore_eos else "--no-ignore-eos")
+    return command
+
+
+def _run_timeline_profile(
+    args: argparse.Namespace,
+    model: str,
+    policy: str,
+    mode: str,
+    trial_dir: Path,
+) -> Path:
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    profile_prefix = trial_dir / "profile"
+    sqlite_path = trial_dir / "profile.sqlite"
+    serve_command = _timeline_serve_command(args, model, policy, mode, trial_dir)
+    profile_command = [
+        "nsys",
+        "profile",
+        "--trace",
+        args.timeline_nsys_trace,
+        "--duration",
+        "0",
+        "--output",
+        str(profile_prefix),
+        "--force-overwrite=true",
+        *serve_command,
+    ]
+    environment = os.environ.copy()
+    environment["VLLM_BENCH_PROFILE_TIMELINE"] = "1"
+    environment["VLLM_BENCH_PROFILE_GPU"] = "1"
+    environment["VLLM_BENCH_PROFILE_SCHEDULER"] = "0"
+    print(f"$ {' '.join(profile_command)}", flush=True)
+    with (trial_dir / "nsys.log").open("w") as log:
+        completed = subprocess.run(
+            profile_command,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=args.server_timeout_s + args.bench_timeout_s,
+            env=environment,
+            check=False,
+        )
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(completed.returncode, profile_command)
+    subprocess.run(
+        [
+            "nsys",
+            "export",
+            "--type=sqlite",
+            "--force-overwrite=true",
+            f"--output={sqlite_path}",
+            f"{profile_prefix}.nsys-rep",
+        ],
+        check=True,
+    )
+    return sqlite_path
+
+
+def _run_timeline_profiles(args: argparse.Namespace, model: str) -> None:
+    for policy in args.timeline_policies:
+        policy_dir = args.output_dir / "timelines" / policy
+        sqlite_paths: list[Path] = []
+        labels: list[str] = []
+        for mode in ("sync", "async"):
+            print(f"Running diagnostic timeline: policy={policy}, mode={mode}", flush=True)
+            sqlite_paths.append(
+                _run_timeline_profile(
+                    args,
+                    model,
+                    policy,
+                    mode,
+                    policy_dir / mode,
+                )
+            )
+            labels.append(f"{policy} {mode}")
+        visualize_scheduler_timeline(
+            sqlite_paths,
+            policy_dir / "cpu_gpu_timeline.png",
+            labels=labels,
+            steps=args.timeline_steps,
+            start_step=args.timeline_start_step,
+            events_output=policy_dir / "cpu_gpu_timeline_events.csv",
+            summary_output=policy_dir / "cpu_gpu_timeline_summary.csv",
+        )
+
+
 def _mean(values: list[float]) -> float:
     return statistics.fmean(values)
 
@@ -703,6 +864,8 @@ def run_scheduling_comparison(args: argparse.Namespace) -> int:
         raise ValueError("--repetitions must be at least 1")
     if args.pyspy_duration < 0:
         raise ValueError("--pyspy-duration must be nonnegative")
+    if args.timeline_steps < 1:
+        raise ValueError("--timeline-steps must be at least 1")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model = resolve_model(args.model)
     policies = list(dict.fromkeys(args.scheduling_policies or [args.scheduling_policy]))
@@ -713,6 +876,11 @@ def run_scheduling_comparison(args: argparse.Namespace) -> int:
         raise ValueError(
             "Scheduling policy names may contain only letters, digits, underscores, and hyphens: "
             f"{', '.join(invalid_policies)}"
+        )
+    unknown_timeline_policies = [policy for policy in args.timeline_policies if policy not in policies]
+    if unknown_timeline_policies:
+        raise ValueError(
+            f"Timeline policies must also be included in --scheduling-policies: {', '.join(unknown_timeline_policies)}"
         )
     environment = _probe_environment(args, policies)
     effective_concurrency = args.max_concurrency or args.max_num_seqs
@@ -733,6 +901,13 @@ def run_scheduling_comparison(args: argparse.Namespace) -> int:
         "collect_dram": args.collect_dram,
         "pyspy_duration_s": args.pyspy_duration,
         "torch_profile_enabled": args.torch_profile_dir is not None,
+        "timeline": {
+            "policies": args.timeline_policies,
+            "steps": args.timeline_steps,
+            "start_step": args.timeline_start_step,
+            "nsys_trace": args.timeline_nsys_trace,
+            "diagnostic_only": True,
+        },
         "scheduler_profiling": {
             "enabled": os.environ.get("VLLM_BENCH_PROFILE_SCHEDULER") == "1",
             "interval": os.environ.get("VLLM_BENCH_PROFILE_INTERVAL", "100"),
@@ -778,5 +953,6 @@ def run_scheduling_comparison(args: argparse.Namespace) -> int:
 
     _aggregate(results, args.output_dir)
     _aggregate_scheduler_timings(results, args.output_dir)
+    _run_timeline_profiles(args, model)
     print(f"Wrote scheduling comparison to {args.output_dir}")
     return 0

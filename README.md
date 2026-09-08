@@ -195,7 +195,7 @@ scripts/vllm-server.sh compare --remote --detach -- \
 The comparison writes trial, summary, paired-comparison, policy-comparison, and impact CSVs plus a
 comparison figure. Custom `radix_cost`, `chunked_hash_tree_python`,
 `chunked_hash_tree_cpp`, and `chunked_hash_tree_bandit` policies live under
-`gpu_memory_benchmarks/serving/schedulers/`. Install the pinned policy-enabled vLLM environment
+`gpu_benchmarks/serving/schedulers/`. Install the pinned policy-enabled vLLM environment
 with:
 
 ```bash
@@ -232,6 +232,25 @@ scripts/vllm-server.sh profile model-gpu --remote --detach \
 CPU timing, py-spy, and NSYS runs should remain separate because combining them changes the
 measurement. CPU `execute_model` duration measures asynchronous host submission; CUDA events are
 used when actual GPU duration is required.
+
+For heavier request policies, clean paired repetitions and separate CPU/GPU timeline traces can
+be produced in one comparison. Timeline trials are diagnostic-only and are excluded from the
+throughput and cumulative timing summaries:
+
+```bash
+VLLM_BENCH_PROFILE_SCHEDULER=1 scripts/vllm-server.sh compare --remote --detach -- \
+  --model llama-3.1-8b --max-model-len 10240 \
+  --random-prefix-len 10000 --random-input-len 20 --random-output-len 50 \
+  --num-prompts 300 --max-num-seqs 100 --max-concurrency 100 \
+  --request-rate inf --repetitions 3 --no-collect-dram \
+  --scheduling-policies fcfs radix_cost chunked_hash_tree_python chunked_hash_tree_bandit \
+  --timeline-policies radix_cost chunked_hash_tree_python chunked_hash_tree_bandit \
+  --timeline-steps 3
+```
+
+Each selected policy gets one sync/async figure under `timelines/<policy>/`, plus an event CSV and
+an overlap summary. Raw NSYS reports and SQLite exports remain remote when the result directory is
+fetched.
 
 ## Direct CLI and visualization
 

@@ -416,6 +416,27 @@ _ASYNC_STEP_REGIONS = (
     ),
 )
 
+_ASYNC_EXECUTE_MODEL_V014 = (
+    "            exec_future = self.model_executor.execute_model(\n"
+    "                scheduler_output, non_block=True\n            )",
+    '            with profile_timing_region("EngineCore.step_with_batch_queue::execute_model_submit"):\n'
+    "                exec_future = self.model_executor.execute_model(\n"
+    "                    scheduler_output, non_block=True\n                )",
+    "execute_model_submit",
+)
+
+
+def _async_step_regions(text: str) -> tuple[tuple[str, str, str], ...]:
+    """Select the vLLM 0.14/0.22 indentation variant for async submission."""
+
+    if _ASYNC_EXECUTE_MODEL_V014[0] not in text:
+        return _ASYNC_STEP_REGIONS
+    return tuple(
+        _ASYNC_EXECUTE_MODEL_V014 if label == "execute_model_submit" else region
+        for region in _ASYNC_STEP_REGIONS
+        for label in (region[2],)
+    )
+
 
 def patch_source_tree(site_packages: Path) -> list[AnchorReport]:
     """Patch an unpacked vLLM installation rooted at site-packages."""
@@ -440,7 +461,7 @@ def patch_source_tree(site_packages: Path) -> list[AnchorReport]:
                 text = _patch_method_regions(
                     text,
                     "step_with_batch_queue",
-                    _ASYNC_STEP_REGIONS,
+                    _async_step_regions(text),
                 )
         if file_target.relative_path == Path("vllm/v1/worker/gpu_model_runner.py"):
             text = _decorate_gpu_method(text, "execute_model", _GPU_DECORATOR)

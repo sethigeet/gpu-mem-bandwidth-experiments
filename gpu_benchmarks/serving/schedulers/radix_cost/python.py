@@ -1,5 +1,7 @@
 """Token-level radix-cost tree from the supplied Feather vLLM fork."""
 
+from __future__ import annotations
+
 from collections import defaultdict, deque
 
 

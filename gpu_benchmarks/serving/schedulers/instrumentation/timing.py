@@ -12,8 +12,10 @@ from typing import Any
 _ENABLED = os.environ.get("VLLM_BENCH_PROFILE_SCHEDULER") == "1"
 _GPU_RANGES_ENABLED = os.environ.get("VLLM_BENCH_PROFILE_GPU") == "1"
 _GPU_EVENTS_ENABLED = os.environ.get("VLLM_BENCH_PROFILE_GPU_EVENTS") == "1"
+_TIMELINE_ENABLED = os.environ.get("VLLM_BENCH_PROFILE_TIMELINE") == "1"
 _INTERVAL = max(1, int(os.environ.get("VLLM_BENCH_PROFILE_INTERVAL", "100")))
 _STATS: dict[str, dict[str, int]] = defaultdict(lambda: {"calls": 0, "total_ns": 0, "min_ns": 2**63 - 1, "max_ns": 0})
+_TIMELINE_CALLS: dict[str, int] = defaultdict(int)
 _GPU_EVENT_PAIRS: dict[str, list[tuple[Any, Any]]] = defaultdict(list)
 _GPU_EVENT_STATS: dict[str, dict[str, float]] = defaultdict(
     lambda: {"calls": 0.0, "total_ms": 0.0, "min_ms": float("inf"), "max_ms": 0.0}
@@ -53,33 +55,62 @@ if _ENABLED:
     atexit.register(_print_final_stats)
 
 
+def _timeline_label(name: str) -> str:
+    _TIMELINE_CALLS[name] += 1
+    return f"gpu_memory:vllm:cpu:{name}:call={_TIMELINE_CALLS[name]}"
+
+
+@contextmanager
+def _timeline_range(name: str):
+    """Emit a per-call NVTX CPU range for cross-process NSYS timelines."""
+
+    if not _TIMELINE_ENABLED:
+        yield
+        return
+
+    import torch  # ty: ignore[unresolved-import]
+
+    torch.cuda.nvtx.range_push(_timeline_label(name))
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
 @contextmanager
 def profile_timing_region(name: str):
     """Measure one exclusive, explicitly named region when timing is enabled."""
 
-    if not _ENABLED:
+    if not (_ENABLED or _TIMELINE_ENABLED):
         yield
         return
-    start = time.perf_counter_ns()
-    try:
-        yield
-    finally:
-        _record(name, time.perf_counter_ns() - start)
+    with _timeline_range(name):
+        if not _ENABLED:
+            yield
+            return
+        start = time.perf_counter_ns()
+        try:
+            yield
+        finally:
+            _record(name, time.perf_counter_ns() - start)
 
 
 def profile_scheduler_function(function: Callable[..., Any]) -> Callable[..., Any]:
-    if not _ENABLED:
+    if not (_ENABLED or _TIMELINE_ENABLED):
         return function
 
     name = getattr(function, "__qualname__", type(function).__qualname__)
 
     @functools.wraps(function)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        start = time.perf_counter_ns()
-        try:
-            return function(*args, **kwargs)
-        finally:
-            _record(name, time.perf_counter_ns() - start)
+        with _timeline_range(name):
+            if not _ENABLED:
+                return function(*args, **kwargs)
+            start = time.perf_counter_ns()
+            try:
+                return function(*args, **kwargs)
+            finally:
+                _record(name, time.perf_counter_ns() - start)
 
     return wrapper
 
@@ -93,10 +124,11 @@ def profile_gpu_range(name: str):
 
         @functools.wraps(function)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            import torch
+            import torch  # ty: ignore[unresolved-import]
 
+            range_name = _timeline_label(name) if _TIMELINE_ENABLED else name
             if _GPU_RANGES_ENABLED:
-                torch.cuda.nvtx.range_push(name)
+                torch.cuda.nvtx.range_push(range_name)
             start_event = end_event = None
             if _GPU_EVENTS_ENABLED:
                 start_event = torch.cuda.Event(enable_timing=True)

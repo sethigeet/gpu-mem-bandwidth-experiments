@@ -14,7 +14,7 @@ from gpu_benchmarks.serving.server import (
 )
 from gpu_benchmarks.serving.timing_analysis import write_reconciled_step_csv
 from gpu_benchmarks.serving.timing_artifacts import generate_overhead_artifacts, write_gpu_event_csv
-from gpu_benchmarks.serving.visualize import summarize_nsys, visualize_nsys
+from gpu_benchmarks.serving.visualize import summarize_nsys, visualize_nsys, visualize_scheduler_timeline
 from gpu_benchmarks.serving.visualize.nsys import write_summary_csv
 
 
@@ -80,6 +80,18 @@ def build_parser() -> argparse.ArgumentParser:
     gpu_events.add_argument("--log", type=Path, required=True)
     gpu_events.add_argument("--output", type=Path, required=True)
 
+    timeline = subparsers.add_parser(
+        "timeline",
+        help="Plot aligned EngineCore CPU phases and GPU kernels from NSYS exports",
+    )
+    timeline.add_argument("inputs", type=Path, nargs="+")
+    timeline.add_argument("--labels", nargs="+")
+    timeline.add_argument("--output", "-o", type=Path, required=True)
+    timeline.add_argument("--events-output", type=Path)
+    timeline.add_argument("--summary-output", type=Path)
+    timeline.add_argument("--steps", type=int, default=3)
+    timeline.add_argument("--start-step", type=int)
+
     return parser
 
 
@@ -121,6 +133,22 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "gpu-event-summary":
         write_gpu_event_csv(args.log, args.output)
+        print(f"Wrote {args.output}")
+        return 0
+    if args.command == "timeline":
+        missing = [path for path in args.inputs if not path.exists()]
+        if missing:
+            print(f"Error: missing timeline input(s): {', '.join(map(str, missing))}", file=sys.stderr)
+            return 1
+        visualize_scheduler_timeline(
+            args.inputs,
+            args.output,
+            labels=args.labels,
+            steps=args.steps,
+            start_step=args.start_step,
+            events_output=args.events_output,
+            summary_output=args.summary_output,
+        )
         print(f"Wrote {args.output}")
         return 0
 
