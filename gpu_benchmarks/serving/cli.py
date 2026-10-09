@@ -25,6 +25,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command")
 
+    from gpu_benchmarks.serving.saturation import add_saturation_args
+
+    saturation = subparsers.add_parser("saturation", help="Sweep resident decode batches to GPU capacity")
+    add_saturation_args(saturation)
+
     serve = subparsers.add_parser("serve", help="Run vLLM serve and drive request load")
     add_serve_profile_args(serve)
 
@@ -99,6 +104,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.command == "saturation":
+        from gpu_benchmarks.serving.saturation import run_saturation
+
+        return run_saturation(args)
     if args.command == "serve":
         return run_serve_profile(args)
     if args.command == "client-nsys":

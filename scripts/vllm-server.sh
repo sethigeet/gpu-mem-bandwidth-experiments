@@ -5,9 +5,9 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_remote.sh"
 
 COMMAND=${1:-}
 case "$COMMAND" in
-  profile|compare|fetch|install|install-policies|install-timing) ;;
+  profile|compare|saturation|fetch|install|install-policies|install-timing) ;;
   *)
-    echo "Usage: $0 {profile|compare|fetch|install|install-policies|install-timing} [serve|client|overhead|model-gpu] [--remote] [--detach] [--host HOST] [--remote-dir DIR] [--out PREFIX] -- [vLLM args]" >&2
+    echo "Usage: $0 {profile|compare|saturation|fetch|install|install-policies|install-timing} [serve|client|overhead|model-gpu] [--remote] [--detach] [--host HOST] [--remote-dir DIR] [--out PREFIX] -- [vLLM args]" >&2
     exit 2
     ;;
 esac
@@ -69,7 +69,9 @@ if [[ "$COMMAND" == "install-policies" ]]; then
   exit 0
 fi
 
-if [[ "$COMMAND" == "compare" ]]; then
+if [[ "$COMMAND" == "saturation" ]]; then
+  OUT=${COMMON_OUT:-results/vllm_saturation_${TIMESTAMP}}
+elif [[ "$COMMAND" == "compare" ]]; then
   OUT=${COMMON_OUT:-results/vllm_scheduling_compare_${TIMESTAMP}}
 elif [[ "$COMMAND" == "profile" ]]; then
   OUT=${COMMON_OUT:-results/vllm_${PROFILE_SCOPE}_nsys_${TIMESTAMP}}
@@ -100,7 +102,15 @@ if [[ "$COMMAND" == "fetch" ]]; then
       --exclude '*.nsys-rep' \
       "$COMMON_HOST:$REMOTE_DIR_ABS/$OUT/" "$OUT/"
     copy_remote_file "$COMMON_HOST" "$REMOTE_DIR_ABS" "${OUT}.remote.log"
-    echo "Copied scheduling comparison results to $OUT (raw NSYS files remain remote)"
+    if [[ -f "$OUT/study.md" && -f "$OUT/saturation_128_unique.png" && -f "$OUT/saturation_10k_shared.png" ]]; then
+      mkdir -p docs/assets
+      cp "$OUT/study.md" docs/vllm_saturation_study.md
+      for workload in 128_unique 10k_shared; do
+        cp "$OUT/saturation_${workload}.png" "docs/assets/vllm_saturation_${workload}.png"
+        cp "$OUT/saturation_${workload}_diagnostics.png" "docs/assets/vllm_saturation_${workload}_diagnostics.png"
+      done
+    fi
+    echo "Copied vLLM results to $OUT (raw NSYS files remain remote)"
   elif ssh "$COMMON_HOST" "test -f $(printf '%q' "$REMOTE_DIR_ABS/${OUT}_timing.csv")"; then
     copy_remote_file "$COMMON_HOST" "$REMOTE_DIR_ABS" "${OUT}_timing.csv"
     copy_remote_file "$COMMON_HOST" "$REMOTE_DIR_ABS" "${OUT}_timing_raw.csv"
@@ -128,6 +138,7 @@ if [[ "$COMMON_REMOTE" == true ]]; then
   REMOTE_DIR_ABS=$(resolve_remote_dir "$COMMON_HOST" "$COMMON_REMOTE_DIR")
   REMOTE_ENV=(env)
   for variable in \
+    VLLM_SATURATION_VENV \
     VLLM_ATTENTION_BACKEND \
     VLLM_BENCH_PROFILE_GPU \
     VLLM_BENCH_PROFILE_INTERVAL \
@@ -140,10 +151,10 @@ if [[ "$COMMON_REMOTE" == true ]]; then
       REMOTE_ENV+=("$variable=${!variable}")
     fi
   done
-  if [[ "$COMMAND" == "compare" ]]; then
+  if [[ "$COMMAND" == "compare" || "$COMMAND" == "saturation" ]]; then
     REMOTE_ARGS=(
       "${REMOTE_ENV[@]}"
-      ./scripts/vllm-server.sh compare --out "$OUT" -- "${COMMON_EXTRA[@]}"
+      ./scripts/vllm-server.sh "$COMMAND" --out "$OUT" -- "${COMMON_EXTRA[@]}"
     )
   else
     REMOTE_ARGS=(
@@ -168,7 +179,19 @@ mkdir -p "$(dirname "$OUT")"
 export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
 export VLLM_USE_FLASHINFER_SAMPLER=${VLLM_USE_FLASHINFER_SAMPLER:-0}
 
-if [[ "$COMMAND" == "compare" ]]; then
+if [[ "$COMMAND" == "saturation" ]]; then
+  if [[ -n ${WAIT_FOR_TMUX_SESSION:-} ]]; then
+    while tmux has-session -t "$WAIT_FOR_TMUX_SESSION" 2>/dev/null; do
+      echo "Waiting for tmux session $WAIT_FOR_TMUX_SESSION to finish"
+      sleep "${GPU_WAIT_INTERVAL_S:-60}"
+    done
+  fi
+  while [[ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits)" ]]; do
+    echo "GPU busy; waiting ${GPU_WAIT_INTERVAL_S:-60} seconds before saturation study"
+    sleep "${GPU_WAIT_INTERVAL_S:-60}"
+  done
+  VIRTUAL_ENV=${VLLM_SATURATION_VENV:-$PROJECT_ROOT/.venv} uv run --active --no-sync python -m gpu_benchmarks.serving.cli saturation --output-dir "$OUT" "${COMMON_EXTRA[@]}"
+elif [[ "$COMMAND" == "compare" ]]; then
   HAS_CUSTOM_POLICY=false
   HAS_VLLM_EXECUTABLE=false
   for arg in "${COMMON_EXTRA[@]}"; do

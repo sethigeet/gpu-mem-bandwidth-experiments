@@ -274,6 +274,7 @@ uv run gpu-memory-benchmarks vllm summarize trace.sqlite -o summary.csv
 ## Studies
 
 - [Synthetic component saturation](docs/component_saturation_study.md)
+- [vLLM resident decode batch saturation](docs/vllm_saturation_study.md)
 - [vLLM scheduling and request policies](docs/vllm_scheduling_study.md)
 - [vLLM attention backend comparison](docs/vllm_attention_backend_study.md)
 - [vLLM CPU overhead investigation](docs/vllm_cpu_overhead_study.md)
